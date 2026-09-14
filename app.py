@@ -3,7 +3,7 @@ import pdfplumber
 import re
 import pandas as pd
 import tempfile
-import os
+import gc
 
 
 def fix_enc(s):
@@ -12,11 +12,15 @@ def fix_enc(s):
     except: return s
 
 
-def is_vedomost_page(page):
+def get_page_tables(page):
+    """Извлекаем таблицы один раз. Возвращаем [] при ошибке."""
     try:
-        tables = page.extract_tables()
+        return page.extract_tables()
     except Exception:
-        return False
+        return []
+
+
+def page_has_mark_name(tables):
     for t in tables:
         if not t or not t[0]: continue
         h = [(x or "").strip().upper() for x in t[0]]
@@ -25,11 +29,19 @@ def is_vedomost_page(page):
     return False
 
 
-def collect_white_list(pdf):
+def collect_white_list(pdf, progress):
+    """Собираем марки, освобождая память после каждой страницы."""
     marks = set()
-    for page in pdf.pages:
-        if not is_vedomost_page(page): continue
-        for t in page.extract_tables():
+    total = len(pdf.pages)
+    for i, page in enumerate(pdf.pages):
+        progress.progress((i + 1) / total, text=f"Поиск ведомости: лист {i+1}/{total}")
+        tables = get_page_tables(page)
+        if not page_has_mark_name(tables):
+            # явно освобождаем
+            del tables
+            gc.collect()
+            continue
+        for t in tables:
             if not t or not t[0]: continue
             h = [(x or "").strip().upper() for x in t[0]]
             if "MARK NAME" not in h: continue
@@ -37,6 +49,8 @@ def collect_white_list(pdf):
             for row in t[2:]:
                 if row and len(row) > cm and row[cm]:
                     marks.add(row[cm].strip())
+        del tables
+        gc.collect()
     return marks
 
 
@@ -178,34 +192,64 @@ def build_result_table(records):
     return pd.DataFrame(rows)
 
 
-def process_pdf(pdf_path):
+def process_pdf(pdf_path, progress):
+    records = []
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
-        marks_set = collect_white_list(pdf)
+
+        # --- Этап 1: белый список марок из ведомости ---
+        progress.progress(0.0, text="Этап 1/2: поиск ведомости марок…")
+        marks_set = collect_white_list(pdf, progress)
         if not marks_set:
             return None, "Не найдено таблиц с MARK NAME."
 
-        records = []
+        # --- Этап 2: обход чертежей ---
         for idx, page in enumerate(pdf.pages):
-            if is_vedomost_page(page): continue
-            words_raw = page.extract_words()
-            if not words_raw: continue
-            words = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
-            if not any(t in marks_set for t, _, _ in words): continue
+            progress.progress(
+                (idx + 1) / total,
+                text=f"Этап 2/2: обработка листа {idx+1}/{total}"
+            )
+            try:
+                tables = get_page_tables(page)
+                if page_has_mark_name(tables):
+                    del tables
+                    gc.collect()
+                    continue
+                del tables
 
-            page_elev = get_header_elev(words)
-            letter_axes = find_letter_axes(words)
-            number_axes = find_number_axes(words)
+                words_raw = page.extract_words()
+                if not words_raw:
+                    gc.collect()
+                    continue
 
-            for t, x, y in words:
-                if t not in marks_set: continue
-                let = nearest_letter(letter_axes, x, y)
-                num = nearest_number(number_axes, x, y)
-                records.append({
-                    'Лист': idx + 1, 'Марка': t,
-                    'Ось-буква': let or '?', 'Ось-цифра': num or '?',
-                    'Отм.': page_elev or '?',
-                })
+                words = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
+                del words_raw
+
+                if not any(t in marks_set for t, _, _ in words):
+                    del words
+                    gc.collect()
+                    continue
+
+                page_elev = get_header_elev(words)
+                letter_axes = find_letter_axes(words)
+                number_axes = find_number_axes(words)
+
+                for t, x, y in words:
+                    if t not in marks_set: continue
+                    let = nearest_letter(letter_axes, x, y)
+                    num = nearest_number(number_axes, x, y)
+                    records.append({
+                        'Лист': idx + 1, 'Марка': t,
+                        'Ось-буква': let or '?', 'Ось-цифра': num or '?',
+                        'Отм.': page_elev or '?',
+                    })
+                del words
+            except Exception as e:
+                # не падаем — просто пропускаем страницу
+                st.warning(f"Лист {idx+1} пропущен из-за ошибки: {e}")
+
+            # освобождаем память после каждой страницы
+            gc.collect()
 
         if not records:
             return None, "Марки не найдены на чертежах."
@@ -217,46 +261,26 @@ def process_pdf(pdf_path):
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title="Парсер марок из PDF", layout="wide")
-import streamlit.components.v1 as components
-components.html(
-    """
-    <script>
-    (function() {
-        const original = Node.prototype.removeChild;
-        Node.prototype.removeChild = function(child) {
-            try {
-                return original.call(this, child);
-            } catch (err) {
-                if (err instanceof Error && /not a child of this node/.test(err.message)) {
-                    console.warn('Ignored removeChild error:', child);
-                    return child;
-                }
-                throw err;
-            }
-        };
-    })();
-    </script>
-    """,
-    height=0,
-)
 st.title("🏗️ Парсер марок из PDF-чертежей")
 st.write(
     "Загрузите PDF с ведомостью марок и чертежами. "
-    "Приложение найдёт каждую марку, её оси и отметку, "
-    "и вернёт Excel-файл."
+    "Приложение найдёт каждую марку, её оси и отметку, и вернёт Excel-файл."
 )
 
 uploaded = st.file_uploader("Выберите PDF-файл", type=["pdf"])
 
 if uploaded is not None:
     if st.button("▶ Обработать", type="primary"):
-        with st.spinner("Обрабатываю PDF…"):
+        progress = st.progress(0.0, text="Подготовка…")
+        try:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
                 tmp.write(uploaded.read())
                 pdf_path = tmp.name
             xlsx_path = pdf_path.replace('.pdf', '.xlsx')
 
-            result, msg = process_pdf(pdf_path)
+            result, msg = process_pdf(pdf_path, progress)
+            progress.empty()
+
             if result is None:
                 st.error(msg)
             else:
@@ -270,3 +294,6 @@ if uploaded is not None:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
                 st.dataframe(result.head(50), use_container_width=True)
+        except Exception as e:
+            progress.empty()
+            st.error(f"Ошибка обработки: {e}")
