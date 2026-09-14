@@ -1,4 +1,7 @@
 import streamlit as st
+
+st.set_page_config(page_title="Парсер марок из PDF", layout="wide")
+
 import pdfplumber
 import re
 import pandas as pd
@@ -13,7 +16,6 @@ def fix_enc(s):
 
 
 def get_page_tables(page):
-    """Извлекаем таблицы один раз. Возвращаем [] при ошибке."""
     try:
         return page.extract_tables()
     except Exception:
@@ -29,15 +31,13 @@ def page_has_mark_name(tables):
     return False
 
 
-def collect_white_list(pdf, progress):
-    """Собираем марки, освобождая память после каждой страницы."""
+def collect_white_list(pdf, status_slot):
     marks = set()
     total = len(pdf.pages)
     for i, page in enumerate(pdf.pages):
-        progress.progress((i + 1) / total, text=f"Поиск ведомости: лист {i+1}/{total}")
+        status_slot.info(f"Этап 1/2 — поиск ведомости: лист {i+1} из {total}")
         tables = get_page_tables(page)
         if not page_has_mark_name(tables):
-            # явно освобождаем
             del tables
             gc.collect()
             continue
@@ -192,23 +192,20 @@ def build_result_table(records):
     return pd.DataFrame(rows)
 
 
-def process_pdf(pdf_path, progress):
+def process_pdf(pdf_path, status_slot):
     records = []
+    skipped = []
+
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
 
-        # --- Этап 1: белый список марок из ведомости ---
-        progress.progress(0.0, text="Этап 1/2: поиск ведомости марок…")
-        marks_set = collect_white_list(pdf, progress)
+        status_slot.info("Этап 1/2 — поиск ведомости марок…")
+        marks_set = collect_white_list(pdf, status_slot)
         if not marks_set:
-            return None, "Не найдено таблиц с MARK NAME."
+            return None, "Не найдено таблиц с MARK NAME.", skipped
 
-        # --- Этап 2: обход чертежей ---
         for idx, page in enumerate(pdf.pages):
-            progress.progress(
-                (idx + 1) / total,
-                text=f"Этап 2/2: обработка листа {idx+1}/{total}"
-            )
+            status_slot.info(f"Этап 2/2 — обработка листа {idx+1} из {total}")
             try:
                 tables = get_page_tables(page)
                 if page_has_mark_name(tables):
@@ -245,22 +242,18 @@ def process_pdf(pdf_path, progress):
                     })
                 del words
             except Exception as e:
-                # не падаем — просто пропускаем страницу
-                st.warning(f"Лист {idx+1} пропущен из-за ошибки: {e}")
-
-            # освобождаем память после каждой страницы
+                skipped.append(f"лист {idx+1}: {e}")
             gc.collect()
 
-        if not records:
-            return None, "Марки не найдены на чертежах."
+    if not records:
+        return None, "Марки не найдены на чертежах.", skipped
 
-        result = build_result_table(records)
-        msg = f"Готово. Листов: {total}, марок в ведомости: {len(marks_set)}, вхождений: {len(records)}."
-        return result, msg
+    result = build_result_table(records)
+    msg = f"Готово. Листов: {total}, марок в ведомости: {len(marks_set)}, вхождений: {len(records)}."
+    return result, msg, skipped
 
 
-# ---------- Streamlit UI ----------
-st.set_page_config(page_title="Парсер марок из PDF", layout="wide")
+# ---------- UI ----------
 st.title("🏗️ Парсер марок из PDF-чертежей")
 st.write(
     "Загрузите PDF с ведомостью марок и чертежами. "
@@ -271,20 +264,23 @@ uploaded = st.file_uploader("Выберите PDF-файл", type=["pdf"])
 
 if uploaded is not None:
     if st.button("▶ Обработать", type="primary"):
-        progress = st.progress(0.0, text="Подготовка…")
+        # Единый слот для статуса — без накопления DOM-элементов
+        status_slot = st.empty()
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
                 tmp.write(uploaded.read())
                 pdf_path = tmp.name
             xlsx_path = pdf_path.replace('.pdf', '.xlsx')
 
-            result, msg = process_pdf(pdf_path, progress)
-            progress.empty()
+            result, msg, skipped = process_pdf(pdf_path, status_slot)
+            status_slot.empty()
 
             if result is None:
                 st.error(msg)
             else:
                 st.success(msg)
+                if skipped:
+                    st.warning("Часть листов пропущена: " + "; ".join(skipped[:10]))
                 result.to_excel(xlsx_path, index=False)
                 with open(xlsx_path, "rb") as f:
                     st.download_button(
@@ -293,7 +289,6 @@ if uploaded is not None:
                         file_name="marks_result.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
-              
         except Exception as e:
-            progress.empty()
+            status_slot.empty()
             st.error(f"Ошибка обработки: {e}")
