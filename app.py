@@ -217,6 +217,28 @@ def process_pdf(pdf_path):
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title="Парсер марок из PDF", layout="wide")
+import streamlit.components.v1 as components
+components.html(
+    """
+    <script>
+    (function() {
+        const original = Node.prototype.removeChild;
+        Node.prototype.removeChild = function(child) {
+            try {
+                return original.call(this, child);
+            } catch (err) {
+                if (err instanceof Error && /not a child of this node/.test(err.message)) {
+                    console.warn('Ignored removeChild error:', child);
+                    return child;
+                }
+                throw err;
+            }
+        };
+    })();
+    </script>
+    """,
+    height=0,
+)
 st.title("🏗️ Парсер марок из PDF-чертежей")
 st.write(
     "Загрузите PDF с ведомостью марок и чертежами. "
