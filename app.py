@@ -293,7 +293,7 @@ if uploaded is not None:
                         file_name="marks_result.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
-                st.dataframe(result.head(50), use_container_width=True)
+              
         except Exception as e:
             progress.empty()
             st.error(f"Ошибка обработки: {e}")
