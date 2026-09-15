@@ -531,68 +531,64 @@ uploaded = st.file_uploader("Выберите PDF-файл", type=["pdf"])
 
 # ---------- ДИАГНОСТИКА ----------
 st.markdown("---")
-st.subheader("🔎 Диагностика: найти марку в PDF")
-diag_mark = st.text_input("Марка для поиска", value="CL-19")
-if st.button("🔎 Найти в PDF"):
-    if uploaded is None:
-        st.warning("Сначала загрузи PDF.")
-    elif not diag_mark.strip():
-        st.warning("Введи марку.")
-    else:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-            tmp.write(uploaded.read())
-            pdf_path = tmp.name
-        target = normalize_text(diag_mark.strip()).upper()
-        found_any = False
-        with pdfplumber.open(pdf_path) as pdf:
-            for i, page in enumerate(pdf.pages):
-                words_raw = page.extract_words()
-                if not words_raw: continue
-                merged = merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5)
-                hits = [(t, round(x), round(y)) for t, x, y in merged
-                        if target in normalize_text(t).upper()]
-                if hits:
-                    found_any = True
-                    st.write(f"**Лист {i+1}** — {len(hits)} совпадений:")
-                    for t, x, y in hits[:15]:
-                        st.write(f"  • `{t}`  (x={x}, y={y})")
-        if not found_any:
-            st.error(f"Текст, содержащий '{target}', не найден ни на одном листе.")
+st.subheader("🔎 Диагностика")
 
-st.markdown("---")
-st.subheader("🖨 Показать все слова на конкретном листе")
-diag_page = st.number_input("Номер листа", min_value=1, max_value=200, value=23, step=1)
-if st.button("🖨 Показать слова"):
+diag_mark = st.text_input("Найти текст (подстрока)", value="CL-19")
+diag_page = st.number_input("Номер листа для детального показа", min_value=1, max_value=300, value=24, step=1)
+
+col_d1, col_d2 = st.columns(2)
+search_clicked = col_d1.button("🔎 Найти по всем листам")
+show_clicked = col_d2.button("🖨 Показать лист")
+
+if search_clicked or show_clicked:
     if uploaded is None:
         st.warning("Сначала загрузи PDF.")
     else:
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
             tmp.write(uploaded.read())
             pdf_path = tmp.name
+
         with pdfplumber.open(pdf_path) as pdf:
-            idx = diag_page - 1
-            if idx < 0 or idx >= len(pdf.pages):
-                st.error(f"Листа {diag_page} нет в файле.")
-            else:
-                page = pdf.pages[idx]
-                words_raw = page.extract_words()
-                st.write(f"**Лист {diag_page}: {len(words_raw)} сырых слов.**")
-                st.write("--- **Сырые (без склейки):**")
-                raw_filtered = []
-                for w in words_raw:
-                    t = fix_enc(w['text'])
-                    if re.match(r'^[A-ZА-Я0-9\-/]{2,}$', t):
-                        raw_filtered.append((t, round(w['x0']), round(w['top'])))
-                st.write(f"Похожих на марку/код: {len(raw_filtered)}")
-                for t, x, y in raw_filtered[:80]:
-                    st.write(f"  • `{t}`  (x={x}, y={y})")
-                st.write("--- **После склейки:**")
-                merged = merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5)
-                merged_filtered = [(t, round(x), round(y)) for t, x, y in merged
-                                   if re.match(r'^[A-ZА-Я0-9\-/]{2,}$', t)]
-                st.write(f"Похожих на марку/код: {len(merged_filtered)}")
-                for t, x, y in merged_filtered[:80]:
-                    st.write(f"  • `{t}`  (x={x}, y={y})")
+            if search_clicked:
+                target = normalize_text(diag_mark.strip()).upper()
+                st.write(f"**Поиск '{target}' (в склеенных и сырых словах):**")
+                found_count = 0
+                for i, page in enumerate(pdf.pages):
+                    words_raw = page.extract_words()
+                    if not words_raw: continue
+                    raw_hits = [fix_enc(w['text']) for w in words_raw
+                                if target in normalize_text(fix_enc(w['text'])).upper()]
+                    merged = merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5)
+                    merged_hits = [t for t, x, y in merged
+                                   if target in normalize_text(t).upper()]
+                    if raw_hits or merged_hits:
+                        found_count += 1
+                        st.write(f"• **Лист {i+1}**: сырых={len(raw_hits)}, склеенных={len(merged_hits)}")
+                        if raw_hits:
+                            st.write(f"    сырые: {raw_hits[:5]}")
+                        if merged_hits:
+                            st.write(f"    склеенные: {merged_hits[:5]}")
+                if found_count == 0:
+                    st.warning(f"'{target}' нигде не найдено.")
+
+            if show_clicked:
+                idx = diag_page - 1
+                if 0 <= idx < len(pdf.pages):
+                    page = pdf.pages[idx]
+                    words_raw = page.extract_words()
+                    st.write(f"**Лист {diag_page}: {len(words_raw)} слов.**")
+                    filtered = []
+                    for w in words_raw:
+                        t = fix_enc(w['text'])
+                        if re.match(r'^[A-ZА-Я0-9\-/]{2,}$', t):
+                            filtered.append((t, round(w['x0']), round(w['top'])))
+                    st.write(f"Похожих на марку/код: {len(filtered)} (показываю до 40)")
+                    for t, x, y in filtered[:40]:
+                        st.write(f"  `{t}`  (x={x}, y={y})")
+                    if len(filtered) > 40:
+                        st.write(f"  … ещё {len(filtered)-40} слов")
+                else:
+                    st.error(f"Листа {diag_page} нет в файле.")
 
 # ---------- ОСНОВНАЯ ОБРАБОТКА ----------
 st.markdown("---")
