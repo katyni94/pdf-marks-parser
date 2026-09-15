@@ -54,8 +54,7 @@ def build_mark_lookup(marks_set):
 
 
 def match_mark(text, marks_by_len, all_marks):
-    """Возвращает каноническую марку или None.
-    Обрабатывает: точное совпадение, reverse-текст, склейку с профилем."""
+    """Возвращает каноническую марку или None."""
     if not text: return None
     t = text.strip().upper()
     if not t: return None
@@ -69,23 +68,39 @@ def match_mark(text, marks_by_len, all_marks):
     if t_rev in all_marks:
         return t_rev
 
-    # 3. Префикс: mark + что-то нецифровое/не-дефисное (B-117I45Ш3 → B-117)
-    for L in marks_by_len:
-        if L >= len(t): continue
+    # 3. Пробуем с самой длинной марки вниз
+    #    Проверяем: prefix + rest, где rest НЕ начинается с цифры
+    #    (т.е. может быть 'I20Ш1', '-6000', '', '/...' и т.д.)
+    for L in sorted(marks_by_len.keys(), reverse=True):
+        if L > len(t): continue
         prefix = t[:L]
-        if prefix in marks_by_len[L]:
-            rest = t[L:]
-            # Следующий символ не должен быть цифрой или дефисом (иначе B-1 заматчит B-117)
-            if rest and not rest[0].isdigit() and rest[0] != '-':
-                return prefix
-    # 4. Reverse + префикс: '7Ш54I3-B' -> reverse -> 'B-345Ш7'? Нет, только reverse
-    for L in marks_by_len:
-        if L >= len(t_rev): continue
+        if prefix not in marks_by_len[L]: continue
+        rest = t[L:]
+        if not rest:
+            return prefix
+        c = rest[0]
+        # Буква — это следующий профиль/код: B-117I45Ш3 → B-117
+        if c.isalpha():
+            return prefix
+        # Дефис + цифры — это размер или продолжение: B-1-6000 → B-1
+        if c == '-' and len(rest) > 1 and rest[1].isdigit():
+            return prefix
+
+    # 4. Reverse + префикс (для '7Ш54I3-B' → reverse → 'B-345Ш7'?
+    #    Или '4-16B' → reverse → 'B61-4' — обрезаем до марки)
+    for L in sorted(marks_by_len.keys(), reverse=True):
+        if L > len(t_rev): continue
         prefix = t_rev[:L]
-        if prefix in marks_by_len[L]:
-            rest = t_rev[L:]
-            if rest and not rest[0].isdigit() and rest[0] != '-':
-                return prefix
+        if prefix not in marks_by_len[L]: continue
+        rest = t_rev[L:]
+        if not rest:
+            return prefix
+        c = rest[0]
+        if c.isalpha():
+            return prefix
+        if c == '-' and len(rest) > 1 and rest[1].isdigit():
+            return prefix
+
     return None
 
 
@@ -122,7 +137,7 @@ def cluster_by(items, axis_idx, tol):
 
 
 # ---------- Склейка разбитых слов ----------
-def merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0):
+def merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5):
     if not words_raw:
         return []
     items = sorted(words_raw, key=lambda w: (round(w['top'], 1), w['x0']))
