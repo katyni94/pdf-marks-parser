@@ -9,7 +9,7 @@ import gc
 import os
 from pypdf import PdfReader, PdfWriter
 
-st.caption("Версия 6.0 — склейка повторяющихся символов осей")
+st.caption("Версия 7.0 — низкий порог для осей + безопасная диагностика")
 
 
 # ---------- Утилиты ----------
@@ -27,7 +27,6 @@ def normalize_text(text):
 
 
 def collapse_repeats(text):
-    """'FFFF' → 'F', '1111' → '1'. Только если весь текст — один и тот же символ 2-4 раза."""
     if not text: return text
     if 2 <= len(text) <= 4 and len(set(text)) == 1:
         return text[0]
@@ -146,8 +145,6 @@ def merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5):
             merged.append((fix_enc(cur['text']), cur['x0'], cur['top']))
             cur = dict(w)
     merged.append((fix_enc(cur['text']), cur['x0'], cur['top']))
-
-    # склеиваем повторы символов (FFFF → F)
     return [(collapse_repeats(t), x, y) for t, x, y in merged]
 
 
@@ -185,7 +182,7 @@ def find_letter_axes_plan(words, wl_letters):
         for t, x, y in gs:
             if not clean or y - clean[-1][2] > 20:
                 clean.append((t, x, y))
-        if len(clean) < 3: continue
+        if len(clean) < 2: continue
         axes.append((sum(xs)/len(xs), [(t, y) for t, _, y in clean]))
     return axes
 
@@ -194,14 +191,14 @@ def find_number_axes_plan(words, wl_numbers):
     items = [(t, x, y) for t, x, y in words if t in wl_numbers]
     axes = []
     for g in cluster_by(items, 2, 6):
-        if len(g) < 3: continue
+        if len(g) < 2: continue
         g = [i for i in g if not (i[1] > 440 and i[2] > 950)]
         gs = sorted(g, key=lambda i: i[1])
         clean = []
         for t, x, y in gs:
             if not clean or x - clean[-1][1] > 15:
                 clean.append((t, x, y))
-        if len(clean) < 3: continue
+        if len(clean) < 2: continue
         xs = [i[1] for i in clean]
         if max(xs) - min(xs) < 100: continue
         axes.append((sum(i[2] for i in clean)/len(clean),
@@ -535,7 +532,9 @@ st.markdown("---")
 st.subheader("🔎 Диагностика")
 
 diag_mark = st.text_input("Найти текст (подстрока)", value="B-106")
-diag_page = st.number_input("Номер листа", min_value=1, max_value=300, value=11, step=1)
+diag_page = st.number_input("Номер листа", min_value=1, max_value=300, value=25, step=1)
+diag_filter = st.text_input("Фильтр слов на листе (подстрока, пусто = все)", value="B-10")
+
 col_d1, col_d2 = st.columns(2)
 search_clicked = col_d1.button("🔎 Найти по всем листам")
 show_clicked = col_d2.button("🖨 Показать лист")
@@ -551,13 +550,16 @@ if search_clicked or show_clicked:
         with pdfplumber.open(pdf_path) as pdf:
             if search_clicked:
                 target = normalize_text(diag_mark.strip()).upper()
-                st.write(f"**Поиск '{target}' (в сырых и склеенных словах):**")
+                st.write(f"**Поиск подстроки '{target}':**")
                 found_count = 0
                 for i, page in enumerate(pdf.pages):
                     words_raw = page.extract_words()
                     if not words_raw: continue
-                    raw_hits = [fix_enc(w['text']) for w in words_raw
-                                if target in normalize_text(fix_enc(w['text'])).upper()]
+                    raw_hits = []
+                    for w in words_raw:
+                        t = fix_enc(w['text'])
+                        if target in normalize_text(t).upper():
+                            raw_hits.append(t)
                     merged = merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5)
                     merged_hits = [t for t, x, y in merged
                                    if target in normalize_text(t).upper()]
@@ -578,34 +580,29 @@ if search_clicked or show_clicked:
                     words_raw = page.extract_words()
                     st.write(f"**Лист {diag_page}: {len(words_raw)} слов.**")
 
-                    # Односимвольные слова (оси?)
-                    singles = []
+                    all_words = []
                     for w in words_raw:
                         t = fix_enc(w['text'])
-                        if re.fullmatch(r'[A-ZА-Я0-9]', t):
-                            singles.append((t, round(w['x0']), round(w['top'])))
-                    st.write(f"--- **Одиночные символы (буквы/цифры — оси?): {len(singles)}**")
-                    for t, x, y in singles[:60]:
-                        st.write(f"  `{t}`  (x={x}, y={y})")
+                        all_words.append((t, round(w['x0']), round(w['top'])))
 
-                    # Слова 2+ символов, но отфильтрованные
-                    others = []
-                    for w in words_raw:
-                        t = fix_enc(collapse_repeats(w['text']))
-                        if len(t) >= 2 and re.match(r'^[A-ZА-Я0-9\-/]+$', t):
-                            others.append((t, round(w['x0']), round(w['top'])))
-                    st.write(f"--- **Слова 2+ символов, похожие на марку/код: {len(others)}**")
-                    for t, x, y in others[:60]:
-                        st.write(f"  `{t}`  (x={x}, y={y})")
+                    if diag_filter.strip():
+                        flt = diag_filter.strip().upper()
+                        all_words = [x for x in all_words if flt in x[0].upper()]
 
-                    st.write(f"--- **Все оставшиеся слова (первые 40):**")
-                    rest = []
-                    for w in words_raw:
-                        t = fix_enc(w['text'])
-                        if not re.fullmatch(r'[A-ZА-Я0-9]', t) and len(t) < 2:
-                            rest.append((t, round(w['x0']), round(w['top'])))
-                    for t, x, y in rest[:40]:
-                        st.write(f"  `{t}`  (x={x}, y={y})")
+                    all_words.sort(key=lambda x: x[0].upper())
+
+                    st.write(f"**Найдено слов по фильтру: {len(all_words)}** (первые 300):")
+                    lines = [f"{t}\t(x={x}, y={y})" for t, x, y in all_words[:300]]
+                    st.text("\n".join(lines) if lines else "(пусто)")
+
+                    singles = [(fix_enc(w['text']), round(w['x0']), round(w['top']))
+                               for w in words_raw
+                               if re.fullmatch(r'[A-ZА-Я0-9]', fix_enc(w['text']))]
+                    if diag_filter.strip():
+                        flt = diag_filter.strip().upper()
+                        singles = [x for x in singles if flt in x[0].upper()]
+                    st.write(f"**Одиночные символы: {len(singles)}** (первые 100):")
+                    st.text("\n".join([f"{t}\t(x={x}, y={y})" for t, x, y in singles[:100]]) if singles else "(пусто)")
                 else:
                     st.error(f"Листа {diag_page} нет в файле.")
 
