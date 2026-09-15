@@ -9,13 +9,22 @@ import gc
 import os
 from pypdf import PdfReader, PdfWriter
 
-st.caption("Версия 4.0 — с нечётким сопоставлением марок")
+st.caption("Версия 5.0 — нормализация тире + матч от длинных к коротким")
+
 
 # ---------- Утилиты ----------
 def fix_enc(s):
     if s is None: return ""
     try: return s.encode('latin-1').decode('cp1251')
     except: return s
+
+
+def normalize_text(text):
+    """Приводит разные тире к обычному дефису."""
+    if not text: return ""
+    for ch in ['–', '—', '−', '‐', '‑', '‒', '―', '﹣', '－']:
+        text = text.replace(ch, '-')
+    return text.strip()
 
 
 def get_page_tables(page):
@@ -46,64 +55,50 @@ def extract_marks_from_tables(tables):
 
 # ---------- Нечёткое сопоставление марки ----------
 def build_mark_lookup(marks_set):
-    """Возвращает (marks_by_len, all_marks) для быстрого поиска."""
+    """Возвращает (marks_by_len, all_marks)."""
     marks_by_len = {}
+    all_marks = set()
     for m in marks_set:
-        marks_by_len.setdefault(len(m), set()).add(m.upper())
-    return marks_by_len, set(m.upper() for m in marks_set)
+        mu = m.upper()
+        marks_by_len.setdefault(len(mu), set()).add(mu)
+        all_marks.add(mu)
+    return marks_by_len, all_marks
 
 
 def match_mark(text, marks_by_len, all_marks):
     """Возвращает каноническую марку или None."""
     if not text: return None
-    t = text.strip().upper()
+    t = normalize_text(text).upper()
     if not t: return None
 
     # 1. Точное совпадение
     if t in all_marks:
         return t
 
-    # 2. Reverse (для '78-B' → 'B-78')
+    # 2. Reverse ('78-B' → 'B-78')
     t_rev = t[::-1]
     if t_rev in all_marks:
         return t_rev
 
-    # 3. Пробуем с самой длинной марки вниз
-    #    Проверяем: prefix + rest, где rest НЕ начинается с цифры
-    #    (т.е. может быть 'I20Ш1', '-6000', '', '/...' и т.д.)
+    # 3. Префикс — от самых длинных марок к коротким.
+    #    Разрешаем любой хвост (буквы, цифры, '-6000', '6шт' и т.п.)
     for L in sorted(marks_by_len.keys(), reverse=True):
-        if L > len(t): continue
+        if L >= len(t): continue
         prefix = t[:L]
-        if prefix not in marks_by_len[L]: continue
-        rest = t[L:]
-        if not rest:
-            return prefix
-        c = rest[0]
-        # Буква — это следующий профиль/код: B-117I45Ш3 → B-117
-        if c.isalpha():
-            return prefix
-        # Дефис + цифры — это размер или продолжение: B-1-6000 → B-1
-        if c == '-' and len(rest) > 1 and rest[1].isdigit():
+        if prefix in marks_by_len[L]:
             return prefix
 
-    # 4. Reverse + префикс (для '7Ш54I3-B' → reverse → 'B-345Ш7'?
-    #    Или '4-16B' → reverse → 'B61-4' — обрезаем до марки)
+    # 4. Reverse + префикс
     for L in sorted(marks_by_len.keys(), reverse=True):
-        if L > len(t_rev): continue
+        if L >= len(t_rev): continue
         prefix = t_rev[:L]
-        if prefix not in marks_by_len[L]: continue
-        rest = t_rev[L:]
-        if not rest:
-            return prefix
-        c = rest[0]
-        if c.isalpha():
-            return prefix
-        if c == '-' and len(rest) > 1 and rest[1].isdigit():
+        if prefix in marks_by_len[L]:
             return prefix
 
     return None
 
 
+# ---------- Отметки ----------
 def get_header_elev(words):
     header = " ".join(t for t, x, y in words if y < 50)
     m = re.search(r'(?:отм|elev)\.?\s*([+-]?\d+[.,]\d{2,3})', header, re.IGNORECASE)
@@ -311,6 +306,7 @@ def combine_numbers(val, number_order):
     return val
 
 
+# ---------- Итоговая таблица ----------
 def build_result_table(records, letter_order, number_order):
     df = pd.DataFrame(records)
     if df.empty: return df
@@ -370,6 +366,7 @@ def build_result_table(records, letter_order, number_order):
     return pd.DataFrame(rows)
 
 
+# ---------- Разбиение PDF ----------
 def split_pdf(pdf_path, chunk_size=12):
     reader = PdfReader(pdf_path)
     total = len(reader.pages)
@@ -384,6 +381,7 @@ def split_pdf(pdf_path, chunk_size=12):
     return total, parts
 
 
+# ---------- Основная обработка ----------
 def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status_slot=None):
     letter_order = {l: i for i, l in enumerate(whitelist_letters)}
     number_order = {n: i for i, n in enumerate(whitelist_numbers)}
@@ -414,7 +412,7 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                         if not words_raw: continue
 
                         words_for_axes = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
-                        words = merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0)
+                        words = merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5)
                         del words_raw
 
                         for t, x, y in words:
@@ -426,7 +424,6 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                         page_elev = get_header_elev(words_for_axes)
                         page_height = page.height
 
-                        # пока не собрали белый список — пропускаем
                         if not marks_set:
                             del words, words_for_axes; gc.collect(); continue
 
@@ -532,9 +529,10 @@ whitelist_numbers = [x.strip().upper() for x in re.split(r'[,\n;]+', numbers_inp
 
 uploaded = st.file_uploader("Выберите PDF-файл", type=["pdf"])
 
+# ---------- ДИАГНОСТИКА ----------
 st.markdown("---")
 st.subheader("🔎 Диагностика: найти марку в PDF")
-diag_mark = st.text_input("Марка для поиска", value="")
+diag_mark = st.text_input("Марка для поиска", value="CL-19")
 if st.button("🔎 Найти в PDF"):
     if uploaded is None:
         st.warning("Сначала загрузи PDF.")
@@ -544,25 +542,59 @@ if st.button("🔎 Найти в PDF"):
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
             tmp.write(uploaded.read())
             pdf_path = tmp.name
-        target = diag_mark.strip().upper()
+        target = normalize_text(diag_mark.strip()).upper()
         found_any = False
         with pdfplumber.open(pdf_path) as pdf:
             for i, page in enumerate(pdf.pages):
                 words_raw = page.extract_words()
                 if not words_raw: continue
-                merged = merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0)
-                hits = []
-                for t, x, y in merged:
-                    if target in t.upper():
-                        hits.append((t, round(x), round(y)))
+                merged = merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5)
+                hits = [(t, round(x), round(y)) for t, x, y in merged
+                        if target in normalize_text(t).upper()]
                 if hits:
                     found_any = True
-                    st.write(f"**Лист {i+1}** ({len(hits)} совпадений):")
-                    for h in hits[:10]:
-                        st.write(f"  • `{h[0]}` (x={h[1]}, y={h[2]})")
+                    st.write(f"**Лист {i+1}** — {len(hits)} совпадений:")
+                    for t, x, y in hits[:15]:
+                        st.write(f"  • `{t}`  (x={x}, y={y})")
         if not found_any:
-            st.error(f"Марка '{target}' не найдена ни на одном листе.")
+            st.error(f"Текст, содержащий '{target}', не найден ни на одном листе.")
 
+st.markdown("---")
+st.subheader("🖨 Показать все слова на конкретном листе")
+diag_page = st.number_input("Номер листа", min_value=1, max_value=200, value=23, step=1)
+if st.button("🖨 Показать слова"):
+    if uploaded is None:
+        st.warning("Сначала загрузи PDF.")
+    else:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+            tmp.write(uploaded.read())
+            pdf_path = tmp.name
+        with pdfplumber.open(pdf_path) as pdf:
+            idx = diag_page - 1
+            if idx < 0 or idx >= len(pdf.pages):
+                st.error(f"Листа {diag_page} нет в файле.")
+            else:
+                page = pdf.pages[idx]
+                words_raw = page.extract_words()
+                st.write(f"**Лист {diag_page}: {len(words_raw)} сырых слов.**")
+                st.write("--- **Сырые (без склейки):**")
+                raw_filtered = []
+                for w in words_raw:
+                    t = fix_enc(w['text'])
+                    if re.match(r'^[A-ZА-Я0-9\-/]{2,}$', t):
+                        raw_filtered.append((t, round(w['x0']), round(w['top'])))
+                st.write(f"Похожих на марку/код: {len(raw_filtered)}")
+                for t, x, y in raw_filtered[:80]:
+                    st.write(f"  • `{t}`  (x={x}, y={y})")
+                st.write("--- **После склейки:**")
+                merged = merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5)
+                merged_filtered = [(t, round(x), round(y)) for t, x, y in merged
+                                   if re.match(r'^[A-ZА-Я0-9\-/]{2,}$', t)]
+                st.write(f"Похожих на марку/код: {len(merged_filtered)}")
+                for t, x, y in merged_filtered[:80]:
+                    st.write(f"  • `{t}`  (x={x}, y={y})")
+
+# ---------- ОСНОВНАЯ ОБРАБОТКА ----------
 st.markdown("---")
 
 if uploaded is not None:
