@@ -9,7 +9,7 @@ import gc
 import os
 from pypdf import PdfReader, PdfWriter
 
-st.caption("Версия 5.0 — нормализация тире + матч от длинных к коротким")
+st.caption("Версия 6.0 — склейка повторяющихся символов осей")
 
 
 # ---------- Утилиты ----------
@@ -20,11 +20,18 @@ def fix_enc(s):
 
 
 def normalize_text(text):
-    """Приводит разные тире к обычному дефису."""
     if not text: return ""
     for ch in ['–', '—', '−', '‐', '‑', '‒', '―', '﹣', '－']:
         text = text.replace(ch, '-')
     return text.strip()
+
+
+def collapse_repeats(text):
+    """'FFFF' → 'F', '1111' → '1'. Только если весь текст — один и тот же символ 2-4 раза."""
+    if not text: return text
+    if 2 <= len(text) <= 4 and len(set(text)) == 1:
+        return text[0]
+    return text
 
 
 def get_page_tables(page):
@@ -55,7 +62,6 @@ def extract_marks_from_tables(tables):
 
 # ---------- Нечёткое сопоставление марки ----------
 def build_mark_lookup(marks_set):
-    """Возвращает (marks_by_len, all_marks)."""
     marks_by_len = {}
     all_marks = set()
     for m in marks_set:
@@ -66,29 +72,21 @@ def build_mark_lookup(marks_set):
 
 
 def match_mark(text, marks_by_len, all_marks):
-    """Возвращает каноническую марку или None."""
     if not text: return None
     t = normalize_text(text).upper()
     if not t: return None
 
-    # 1. Точное совпадение
-    if t in all_marks:
-        return t
+    if t in all_marks: return t
 
-    # 2. Reverse ('78-B' → 'B-78')
     t_rev = t[::-1]
-    if t_rev in all_marks:
-        return t_rev
+    if t_rev in all_marks: return t_rev
 
-    # 3. Префикс — от самых длинных марок к коротким.
-    #    Разрешаем любой хвост (буквы, цифры, '-6000', '6шт' и т.п.)
     for L in sorted(marks_by_len.keys(), reverse=True):
         if L >= len(t): continue
         prefix = t[:L]
         if prefix in marks_by_len[L]:
             return prefix
 
-    # 4. Reverse + префикс
     for L in sorted(marks_by_len.keys(), reverse=True):
         if L >= len(t_rev): continue
         prefix = t_rev[:L]
@@ -148,7 +146,9 @@ def merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5):
             merged.append((fix_enc(cur['text']), cur['x0'], cur['top']))
             cur = dict(w)
     merged.append((fix_enc(cur['text']), cur['x0'], cur['top']))
-    return merged
+
+    # склеиваем повторы символов (FFFF → F)
+    return [(collapse_repeats(t), x, y) for t, x, y in merged]
 
 
 # ---------- Тип страницы ----------
@@ -411,7 +411,8 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                         words_raw = page.extract_words()
                         if not words_raw: continue
 
-                        words_for_axes = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
+                        words_for_axes = [(fix_enc(collapse_repeats(w['text'])), w['x0'], w['top'])
+                                          for w in words_raw]
                         words = merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5)
                         del words_raw
 
@@ -532,10 +533,8 @@ uploaded = st.file_uploader("Выберите PDF-файл", type=["pdf"])
 # ---------- ДИАГНОСТИКА ----------
 st.markdown("---")
 st.subheader("🔎 Диагностика")
-
 diag_mark = st.text_input("Найти текст (подстрока)", value="CL-19")
-diag_page = st.number_input("Номер листа для детального показа", min_value=1, max_value=300, value=24, step=1)
-
+diag_page = st.number_input("Номер листа", min_value=1, max_value=300, value=23, step=1)
 col_d1, col_d2 = st.columns(2)
 search_clicked = col_d1.button("🔎 Найти по всем листам")
 show_clicked = col_d2.button("🖨 Показать лист")
@@ -551,7 +550,7 @@ if search_clicked or show_clicked:
         with pdfplumber.open(pdf_path) as pdf:
             if search_clicked:
                 target = normalize_text(diag_mark.strip()).upper()
-                st.write(f"**Поиск '{target}' (в склеенных и сырых словах):**")
+                st.write(f"**Поиск '{target}':**")
                 found_count = 0
                 for i, page in enumerate(pdf.pages):
                     words_raw = page.extract_words()
@@ -579,14 +578,12 @@ if search_clicked or show_clicked:
                     st.write(f"**Лист {diag_page}: {len(words_raw)} слов.**")
                     filtered = []
                     for w in words_raw:
-                        t = fix_enc(w['text'])
+                        t = fix_enc(collapse_repeats(w['text']))
                         if re.match(r'^[A-ZА-Я0-9\-/]{2,}$', t):
                             filtered.append((t, round(w['x0']), round(w['top'])))
                     st.write(f"Похожих на марку/код: {len(filtered)} (показываю до 40)")
                     for t, x, y in filtered[:40]:
                         st.write(f"  `{t}`  (x={x}, y={y})")
-                    if len(filtered) > 40:
-                        st.write(f"  … ещё {len(filtered)-40} слов")
                 else:
                     st.error(f"Листа {diag_page} нет в файле.")
 
