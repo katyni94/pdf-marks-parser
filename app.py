@@ -9,7 +9,7 @@ import gc
 import os
 from pypdf import PdfReader, PdfWriter
 
-st.caption("Версия 3.0 — с диагностикой поиска")
+st.caption("Версия 4.0 — с нечётким сопоставлением марок")
 
 # ---------- Утилиты ----------
 def fix_enc(s):
@@ -44,6 +44,51 @@ def extract_marks_from_tables(tables):
     return found
 
 
+# ---------- Нечёткое сопоставление марки ----------
+def build_mark_lookup(marks_set):
+    """Возвращает (marks_by_len, all_marks) для быстрого поиска."""
+    marks_by_len = {}
+    for m in marks_set:
+        marks_by_len.setdefault(len(m), set()).add(m.upper())
+    return marks_by_len, set(m.upper() for m in marks_set)
+
+
+def match_mark(text, marks_by_len, all_marks):
+    """Возвращает каноническую марку или None.
+    Обрабатывает: точное совпадение, reverse-текст, склейку с профилем."""
+    if not text: return None
+    t = text.strip().upper()
+    if not t: return None
+
+    # 1. Точное совпадение
+    if t in all_marks:
+        return t
+
+    # 2. Reverse (для '78-B' → 'B-78')
+    t_rev = t[::-1]
+    if t_rev in all_marks:
+        return t_rev
+
+    # 3. Префикс: mark + что-то нецифровое/не-дефисное (B-117I45Ш3 → B-117)
+    for L in marks_by_len:
+        if L >= len(t): continue
+        prefix = t[:L]
+        if prefix in marks_by_len[L]:
+            rest = t[L:]
+            # Следующий символ не должен быть цифрой или дефисом (иначе B-1 заматчит B-117)
+            if rest and not rest[0].isdigit() and rest[0] != '-':
+                return prefix
+    # 4. Reverse + префикс: '7Ш54I3-B' -> reverse -> 'B-345Ш7'? Нет, только reverse
+    for L in marks_by_len:
+        if L >= len(t_rev): continue
+        prefix = t_rev[:L]
+        if prefix in marks_by_len[L]:
+            rest = t_rev[L:]
+            if rest and not rest[0].isdigit() and rest[0] != '-':
+                return prefix
+    return None
+
+
 def get_header_elev(words):
     header = " ".join(t for t, x, y in words if y < 50)
     m = re.search(r'(?:отм|elev)\.?\s*([+-]?\d+[.,]\d{2,3})', header, re.IGNORECASE)
@@ -76,6 +121,7 @@ def cluster_by(items, axis_idx, tol):
     return groups
 
 
+# ---------- Склейка разбитых слов ----------
 def merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0):
     if not words_raw:
         return []
@@ -95,10 +141,10 @@ def merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0):
     return merged
 
 
+# ---------- Тип страницы ----------
 def parse_section_designation(header_text):
     m = re.search(r"([A-ZА-Я0-9\'/]+)-([A-ZА-Я0-9\'/]+)\s*\(\s*(\d+)\s*\)", header_text.upper())
-    if m:
-        return m.group(1), m.group(2), m.group(3)
+    if m: return m.group(1), m.group(2), m.group(3)
     return None
 
 
@@ -115,6 +161,7 @@ def detect_page_type(header_text):
     return "unknown"
 
 
+# ---------- Оси ----------
 def find_letter_axes_plan(words, wl_letters):
     items = [(t, x, y) for t, x, y in words if t in wl_letters]
     axes = []
@@ -332,8 +379,7 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
     marks_set = set()
     skipped = []
     candidates = []
-    all_found_texts = set()  # диагностика
-    mark_re = re.compile(r'^[A-ZА-Я]{1,4}-?\d{1,4}$')
+    all_found_texts = set()
 
     for idx, (start, end, part_path) in enumerate(parts):
         if status_slot:
@@ -356,9 +402,8 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                         words = merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0)
                         del words_raw
 
-                        # диагностика: все "похожие на марки" тексты
                         for t, x, y in words:
-                            if mark_re.match(t):
+                            if re.match(r'^[A-ZА-Я0-9\-/]{3,}$', t):
                                 all_found_texts.add(t)
 
                         header = " ".join(t for t, x, y in words_for_axes if y < 150)
@@ -366,11 +411,18 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                         page_elev = get_header_elev(words_for_axes)
                         page_height = page.height
 
+                        # пока не собрали белый список — пропускаем
+                        if not marks_set:
+                            del words, words_for_axes; gc.collect(); continue
+
+                        marks_by_len, all_marks = build_mark_lookup(marks_set)
+
                         if ptype == "node":
                             for t, x, y in words:
-                                if not mark_re.match(t): continue
+                                m = match_mark(t, marks_by_len, all_marks)
+                                if not m: continue
                                 candidates.append({
-                                    'Лист': global_num, 'Марка': t,
+                                    'Лист': global_num, 'Марка': m,
                                     'Ось-буква': 'узел', 'Ось-цифра': 'узел',
                                     'Отм.': page_elev or '?',
                                 })
@@ -379,7 +431,6 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                         if ptype == "section":
                             section = parse_section_designation(header)
                             letters_row = find_letters_in_section(words_for_axes, wl_letters_set, page_height)
-
                             num_default = None
                             if section:
                                 a, b, _ = section
@@ -390,30 +441,33 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                                     num_default = f"{nums[0]}-{nums[1]}"
 
                             for t, x, y in words:
-                                if not mark_re.match(t): continue
+                                m = match_mark(t, marks_by_len, all_marks)
+                                if not m: continue
                                 let_raw = nearest_in_letters_row(letters_row, x)
                                 let = combine_letters(let_raw, letter_order) if let_raw else '?'
                                 num = num_default or '?'
                                 elev = find_near_elev(words, x, y) or page_elev or '?'
                                 candidates.append({
-                                    'Лист': global_num, 'Марка': t,
+                                    'Лист': global_num, 'Марка': m,
                                     'Ось-буква': let, 'Ось-цифра': num,
                                     'Отм.': elev,
                                 })
                             del words, words_for_axes; gc.collect(); continue
 
+                        # план / unknown
                         letter_axes = find_letter_axes_plan(words_for_axes, wl_letters_set)
                         number_axes = find_number_axes_plan(words_for_axes, wl_numbers_set)
 
                         for t, x, y in words:
-                            if not mark_re.match(t): continue
+                            m = match_mark(t, marks_by_len, all_marks)
+                            if not m: continue
                             let_raw = nearest_in_col(letter_axes, x, y)
                             num_raw = nearest_in_row(number_axes, x, y)
                             let = combine_letters(let_raw, letter_order) if let_raw else '?'
                             num = combine_numbers(num_raw, number_order) if num_raw else '?'
                             elev = find_near_elev(words, x, y) or page_elev or '?'
                             candidates.append({
-                                'Лист': global_num, 'Марка': t,
+                                'Лист': global_num, 'Марка': m,
                                 'Ось-буква': let, 'Ось-цифра': num,
                                 'Отм.': elev,
                             })
@@ -431,14 +485,13 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
     if not marks_set:
         return None, "Не найдено таблиц с MARK NAME.", skipped, set(), pd.DataFrame(), all_found_texts
 
-    records = [r for r in candidates if r['Марка'] in marks_set]
+    records = candidates
     if not records:
         return None, "Марки из ведомости не найдены на чертежах.", skipped, marks_set, pd.DataFrame(), all_found_texts
 
     result = build_result_table(records, letter_order, number_order)
     found_marks = set(r['Марка'] for r in records)
     missing = marks_set - found_marks
-
     missing_df = pd.DataFrame({'Пропавшие марки': sorted(missing)}) if missing else pd.DataFrame()
 
     msg = (f"Готово. Листов: {total}, марок в ведомости: {len(marks_set)}, "
@@ -455,25 +508,17 @@ st.write(
 
 col1, col2 = st.columns(2)
 with col1:
-    letters_input = st.text_input(
-        "Буквенные оси (через запятую)",
-        value="A, B, C, D, E, F",
-    )
+    letters_input = st.text_input("Буквенные оси (через запятую)", value="A, B, C, D, E, F")
 with col2:
-    numbers_input = st.text_input(
-        "Цифровые оси (через запятую)",
-        value="1, 2, 3",
-    )
+    numbers_input = st.text_input("Цифровые оси (через запятую)", value="1, 2, 3")
 
 whitelist_letters = [x.strip().upper() for x in re.split(r'[,\n;]+', letters_input) if x.strip()]
 whitelist_numbers = [x.strip().upper() for x in re.split(r'[,\n;]+', numbers_input) if x.strip()]
 
 uploaded = st.file_uploader("Выберите PDF-файл", type=["pdf"])
 
-# ---------- ДИАГНОСТИКА: поиск конкретной марки ----------
 st.markdown("---")
 st.subheader("🔎 Диагностика: найти марку в PDF")
-st.caption("Введи марку (например B-2), нажми Найти — покажу все листы, где она встречается, и как извлекается.")
 diag_mark = st.text_input("Марка для поиска", value="")
 if st.button("🔎 Найти в PDF"):
     if uploaded is None:
@@ -490,34 +535,19 @@ if st.button("🔎 Найти в PDF"):
             for i, page in enumerate(pdf.pages):
                 words_raw = page.extract_words()
                 if not words_raw: continue
-                raw_texts = [fix_enc(w['text']) for w in words_raw]
                 merged = merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0)
-
-                # Ищем точное совпадение в склеенных
-                hits_merged = [(t, x, y) for t, x, y in merged if t.upper() == target]
-                # Ищем точное совпадение в оригинале
-                hits_raw = [(t, w['x0'], w['top']) for t, w in zip(raw_texts, words_raw) if t.upper() == target]
-
-                if hits_merged or hits_raw:
+                hits = []
+                for t, x, y in merged:
+                    if target in t.upper():
+                        hits.append((t, round(x), round(y)))
+                if hits:
                     found_any = True
-                    st.write(f"**Лист {i+1}**:")
-                    if hits_merged:
-                        st.write(f"  ✅ Найдено в склеенных: {[(t, round(x), round(y)) for t,x,y in hits_merged]}")
-                    if hits_raw:
-                        st.write(f"  ✅ Найдено в оригинале: {[(t, round(x), round(y)) for t,x,y in hits_raw]}")
-
-                # Ищем частичные совпадения (буква + цифра в радиусе)
-                prefix = target.split('-')[0] if '-' in target else target[:2]
-                for j, w in enumerate(raw_texts):
-                    if prefix.upper() in w.upper() and w.upper() != target:
-                        context = raw_texts[max(0,j-3):j+5]
-                        if target.split('-')[-1] in " ".join(context):
-                            st.write(f"  ⚠️ Лист {i+1}, контекст: {context}")
-
+                    st.write(f"**Лист {i+1}** ({len(hits)} совпадений):")
+                    for h in hits[:10]:
+                        st.write(f"  • `{h[0]}` (x={h[1]}, y={h[2]})")
         if not found_any:
-            st.error(f"Марка '{target}' не найдена ни на одном листе (ни в склеенном виде, ни в оригинале).")
+            st.error(f"Марка '{target}' не найдена ни на одном листе.")
 
-# ---------- ОСНОВНАЯ ОБРАБОТКА ----------
 st.markdown("---")
 
 if uploaded is not None:
@@ -545,14 +575,13 @@ if uploaded is not None:
                         st.warning("Пропущенные листы: " + "; ".join(skipped[:10]))
                     if missing:
                         st.warning(
-                            f"**Не найдено на чертежах: {len(missing)} марок.** "
+                            f"**Не найдено: {len(missing)} марок.** "
                             f"Первые 30: " + ", ".join(sorted(missing)[:30])
                         )
                     with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
                         result.to_excel(writer, sheet_name='Марки', index=False)
                         if not missing_df.empty:
                             missing_df.to_excel(writer, sheet_name='Не найдено', index=False)
-                        # Все марко-подобные тексты, найденные в PDF
                         if all_found:
                             pd.DataFrame({'Найдено в PDF': sorted(all_found)}).to_excel(
                                 writer, sheet_name='Все тексты марок', index=False)
