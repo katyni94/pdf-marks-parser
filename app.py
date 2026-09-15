@@ -586,8 +586,7 @@ with st.expander("⚙️ Настройки", expanded=True):
     reduce_enabled = st.checkbox(
         "Сокращать длинные марки из ведомости",
         value=True,
-        help="Например, NZTM-128-21-ST-401-KMD1.5-B0001 → B-1. Отключите, если в вашей ведомости "
-             "уже короткие марки вида B-1."
+        help="Например, NZTM-128-21-ST-401-KMD1.5-B0001 → B-1."
     )
 
 whitelist_letters = [x.strip().upper() for x in re.split(r'[,\n;]+', letters_input) if x.strip()]
@@ -607,34 +606,24 @@ if uploaded is not None:
                     pdf_path = tmp.name
                 xlsx_path = pdf_path.replace('.pdf', '.xlsx')
 
-                # === Этап 1: whitelist ===
+                # Этап 1 — БЕЗ промежуточных обновлений UI
                 status.info("⏳ Этап 1/2 — читаю ведомость марок…")
-                marks_raw = collect_whitelist(pdf_path, status)
+                marks_raw = collect_whitelist(pdf_path, None)
 
                 if not marks_raw:
                     status.empty()
                     st.error("В файле не найдены таблицы с колонкой MARK NAME. "
                              "Проверьте, что ведомость марок есть в этом PDF.")
                 else:
-                    # Сокращение
                     if reduce_enabled:
                         marks_set = reduce_marks_set(marks_raw)
                     else:
                         marks_set = set(m.strip().upper() for m in marks_raw)
 
-                    # Показать примеры сокращения
-                    sample_raw = sorted(marks_raw)[:5]
-                    sample_red = [reduce_mark(m) for m in sample_raw] if reduce_enabled else sample_raw
-                    examples = "\n".join([f"   {a}  →  {b}" for a, b in zip(sample_raw, sample_red)])
-                    st.info(
-                        f"📋 Найдено марок в ведомости: **{len(marks_raw)}**\n"
-                        f"После обработки: **{len(marks_set)}** уникальных.\n\n"
-                        f"Примеры:\n```\n{examples}\n```"
-                    )
-
-                    # === Этап 2: чертежи ===
+                    # Этап 2 — БЕЗ промежуточных обновлений UI
+                    status.info("⏳ Этап 2/2 — обрабатываю чертежи…")
                     candidates, all_elevs, skipped, letter_order, number_order = process_drawings(
-                        pdf_path, whitelist_letters, whitelist_numbers, marks_set, status)
+                        pdf_path, whitelist_letters, whitelist_numbers, marks_set, None)
                     status.empty()
 
                     result = build_result_table(
@@ -642,12 +631,23 @@ if uploaded is not None:
                         whitelist_letters, whitelist_numbers, all_elevs, marks_set)
 
                     found_marks = set(r['Марка'] for r in candidates)
-                    msg = (f"✅ Готово. Марок в ведомости: {len(marks_set)}, "
-                           f"найдено на чертежах: {len(found_marks)}, "
-                           f"вхождений: {len(candidates)}.")
+
+                    # Итоговая сводка ОДНИМ сообщением
+                    st.success(f"✅ Готово.")
+                    st.write(f"**Марок в ведомости:** {len(marks_raw)} → после обработки **{len(marks_set)}** уникальных.")
+                    st.write(f"**Найдено на чертежах:** {len(found_marks)}")
+                    st.write(f"**Вхождений:** {len(candidates)}")
+
                     if skipped:
-                        msg += f" Пропущено листов: {len(skipped)}."
-                    st.success(msg)
+                        st.warning("Пропущено листов: " + "; ".join(skipped[:5]))
+
+                    # Примеры сокращения — простым текстом, без markdown
+                    if reduce_enabled and marks_raw:
+                        sample_raw = sorted(marks_raw)[:5]
+                        sample_str = " | ".join(
+                            f"{a} → {reduce_mark(a)}" for a in sample_raw
+                        )
+                        st.caption(f"Примеры: {sample_str}")
 
                     result.to_excel(xlsx_path, index=False)
                     with open(xlsx_path, "rb") as f:
