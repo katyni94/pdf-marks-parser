@@ -75,9 +75,34 @@ def cluster_by(items, axis_idx, tol):
     return groups
 
 
+# ---------- НОВОЕ: склейка разбитых слов ----------
+def merge_adjacent_words(words_raw, gap_max=2.5, y_tol=1.5):
+    """Склеивает соседние слова, у которых нет пробела между ними.
+    ['B','-','1'] → ['B-1'].  ['A',\"'\"] → [\"A'\"].
+    words_raw — список словарей от pdfplumber.extract_words() с x0,x1,top.
+    Возвращает список кортежей (text, x0, top).
+    """
+    if not words_raw:
+        return []
+    items = sorted(words_raw, key=lambda w: (round(w['top'], 1), w['x0']))
+    merged = []
+    cur = dict(items[0])
+    for w in items[1:]:
+        same_line = abs(w['top'] - cur['top']) < y_tol
+        gap = w['x0'] - cur['x1']
+        if same_line and -0.5 <= gap <= gap_max:
+            cur['text'] = cur['text'] + w['text']
+            cur['x1'] = w['x1']
+        else:
+            merged.append((fix_enc(cur['text']), cur['x0'], cur['top']))
+            cur = dict(w)
+    merged.append((fix_enc(cur['text']), cur['x0'], cur['top']))
+    return merged
+
+
 # ---------- Тип страницы и обозначение разреза ----------
 def parse_section_designation(header_text):
-    m = re.search(r'([A-ZА-Я0-9\'/]+)-([A-ZА-Я0-9\'/]+)\s*\(\s*(\d+)\s*\)', header_text.upper())
+    m = re.search(r"([A-ZА-Я0-9\'/]+)-([A-ZА-Я0-9\'/]+)\s*\(\s*(\d+)\s*\)", header_text.upper())
     if m:
         return m.group(1), m.group(2), m.group(3)
     return None
@@ -98,7 +123,6 @@ def detect_page_type(header_text):
 
 # ---------- Поиск осей на плане по whitelist ----------
 def find_letter_axes_plan(words, wl_letters):
-    """Вертикальные колонки букв из whitelist."""
     items = [(t, x, y) for t, x, y in words if t in wl_letters]
     axes = []
     for g in cluster_by(items, 1, 12):
@@ -117,7 +141,6 @@ def find_letter_axes_plan(words, wl_letters):
 
 
 def find_number_axes_plan(words, wl_numbers):
-    """Горизонтальные ряды цифр из whitelist."""
     items = [(t, x, y) for t, x, y in words if t in wl_numbers]
     axes = []
     for g in cluster_by(items, 2, 6):
@@ -137,7 +160,6 @@ def find_number_axes_plan(words, wl_numbers):
 
 
 def find_letters_in_section(words, wl_letters, page_height):
-    """Буквы в нижней части листа-разреза."""
     items = [(t, x, y) for t, x, y in words
              if t in wl_letters and y > page_height * 0.6]
     if not items: return []
@@ -155,7 +177,6 @@ def find_letters_in_section(words, wl_letters, page_height):
 
 # ---------- Поиск ближайшей оси ----------
 def nearest_in_col(letter_axes, x, y):
-    """Возвращает одну букву или [a, b] если между осями."""
     if not letter_axes: return None
     nearest_col = min(letter_axes, key=lambda la: abs(la[0] - x))
     col_x, col_items = nearest_col
@@ -340,7 +361,8 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
 
                         words_raw = page.extract_words()
                         if not words_raw: continue
-                        words = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
+                        # НОВОЕ: склейка разбитых слов
+                        words = merge_adjacent_words(words_raw)
                         del words_raw
 
                         header = " ".join(t for t, x, y in words if y < 150)
@@ -412,15 +434,18 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
         gc.collect()
 
     if not marks_set:
-        return None, "Не найдено таблиц с MARK NAME.", skipped
+        return None, "Не найдено таблиц с MARK NAME.", skipped, set()
 
     records = [r for r in candidates if r['Марка'] in marks_set]
     if not records:
-        return None, "Марки из ведомости не найдены на чертежах.", skipped
+        return None, "Марки из ведомости не найдены на чертежах.", skipped, marks_set
 
     result = build_result_table(records, letter_order, number_order)
-    msg = f"Готово. Листов: {total}, марок: {len(marks_set)}, вхождений: {len(records)}."
-    return result, msg, skipped
+    found_marks = set(r['Марка'] for r in records)
+    missing = marks_set - found_marks
+
+    msg = f"Готово. Листов: {total}, марок в ведомости: {len(marks_set)}, найдено марок: {len(found_marks)}, вхождений: {len(records)}."
+    return result, msg, skipped, missing
 
 
 # ---------- UI ----------
@@ -435,7 +460,7 @@ with col1:
     letters_input = st.text_input(
         "Буквенные оси (через запятую)",
         value="A, B, C, D, E, F",
-        help="Порядок важен! По нему строятся диапазоны, например A, B, C, D → диапазон D-A. Можно: A', B/1",
+        help="Порядок важен! По нему строятся диапазоны. Можно: A', B/1",
     )
 with col2:
     numbers_input = st.text_input(
@@ -462,7 +487,7 @@ if uploaded is not None:
                 xlsx_path = pdf_path.replace('.pdf', '.xlsx')
 
                 status.info("⏳ Начинаю обработку…")
-                result, msg, skipped = process_pdf_by_chunks(
+                result, msg, skipped, missing = process_pdf_by_chunks(
                     pdf_path, whitelist_letters, whitelist_numbers, status)
                 status.empty()
 
@@ -472,6 +497,11 @@ if uploaded is not None:
                     st.success(msg)
                     if skipped:
                         st.warning("Пропущенные листы: " + "; ".join(skipped[:10]))
+                    if missing:
+                        st.warning(
+                            f"**Не найдено на чертежах: {len(missing)} марок.** "
+                            f"Первые 30: " + ", ".join(sorted(missing)[:30])
+                        )
                     result.to_excel(xlsx_path, index=False)
                     with open(xlsx_path, "rb") as f:
                         st.download_button(
