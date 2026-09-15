@@ -533,8 +533,9 @@ uploaded = st.file_uploader("Выберите PDF-файл", type=["pdf"])
 # ---------- ДИАГНОСТИКА ----------
 st.markdown("---")
 st.subheader("🔎 Диагностика")
-diag_mark = st.text_input("Найти текст (подстрока)", value="CL-19")
-diag_page = st.number_input("Номер листа", min_value=1, max_value=300, value=23, step=1)
+
+diag_mark = st.text_input("Найти текст (подстрока)", value="B-106")
+diag_page = st.number_input("Номер листа", min_value=1, max_value=300, value=11, step=1)
 col_d1, col_d2 = st.columns(2)
 search_clicked = col_d1.button("🔎 Найти по всем листам")
 show_clicked = col_d2.button("🖨 Показать лист")
@@ -550,7 +551,7 @@ if search_clicked or show_clicked:
         with pdfplumber.open(pdf_path) as pdf:
             if search_clicked:
                 target = normalize_text(diag_mark.strip()).upper()
-                st.write(f"**Поиск '{target}':**")
+                st.write(f"**Поиск '{target}' (в сырых и склеенных словах):**")
                 found_count = 0
                 for i, page in enumerate(pdf.pages):
                     words_raw = page.extract_words()
@@ -576,13 +577,34 @@ if search_clicked or show_clicked:
                     page = pdf.pages[idx]
                     words_raw = page.extract_words()
                     st.write(f"**Лист {diag_page}: {len(words_raw)} слов.**")
-                    filtered = []
+
+                    # Односимвольные слова (оси?)
+                    singles = []
+                    for w in words_raw:
+                        t = fix_enc(w['text'])
+                        if re.fullmatch(r'[A-ZА-Я0-9]', t):
+                            singles.append((t, round(w['x0']), round(w['top'])))
+                    st.write(f"--- **Одиночные символы (буквы/цифры — оси?): {len(singles)}**")
+                    for t, x, y in singles[:60]:
+                        st.write(f"  `{t}`  (x={x}, y={y})")
+
+                    # Слова 2+ символов, но отфильтрованные
+                    others = []
                     for w in words_raw:
                         t = fix_enc(collapse_repeats(w['text']))
-                        if re.match(r'^[A-ZА-Я0-9\-/]{2,}$', t):
-                            filtered.append((t, round(w['x0']), round(w['top'])))
-                    st.write(f"Похожих на марку/код: {len(filtered)} (показываю до 40)")
-                    for t, x, y in filtered[:40]:
+                        if len(t) >= 2 and re.match(r'^[A-ZА-Я0-9\-/]+$', t):
+                            others.append((t, round(w['x0']), round(w['top'])))
+                    st.write(f"--- **Слова 2+ символов, похожие на марку/код: {len(others)}**")
+                    for t, x, y in others[:60]:
+                        st.write(f"  `{t}`  (x={x}, y={y})")
+
+                    st.write(f"--- **Все оставшиеся слова (первые 40):**")
+                    rest = []
+                    for w in words_raw:
+                        t = fix_enc(w['text'])
+                        if not re.fullmatch(r'[A-ZА-Я0-9]', t) and len(t) < 2:
+                            rest.append((t, round(w['x0']), round(w['top'])))
+                    for t, x, y in rest[:40]:
                         st.write(f"  `{t}`  (x={x}, y={y})")
                 else:
                     st.error(f"Листа {diag_page} нет в файле.")
