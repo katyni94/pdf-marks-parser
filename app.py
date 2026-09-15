@@ -18,18 +18,15 @@ def fix_enc(s):
 
 
 def get_page_tables(page):
-    try:
-        return page.extract_tables()
-    except Exception:
-        return []
+    try: return page.extract_tables()
+    except Exception: return []
 
 
 def page_has_mark_name(tables):
     for t in tables:
         if not t or not t[0]: continue
         h = [(x or "").strip().upper() for x in t[0]]
-        if "MARK NAME" in h:
-            return True
+        if "MARK NAME" in h: return True
     return False
 
 
@@ -57,8 +54,7 @@ def get_header_elev(words):
 def find_near_elev(words, mark_x, mark_y):
     best = None; best_d = 1e9
     for t, x, y in words:
-        if not re.fullmatch(r'[+-]?\d+[.,]\d{2,3}', t):
-            continue
+        if not re.fullmatch(r'[+-]?\d+[.,]\d{2,3}', t): continue
         if abs(x - mark_x) > 120: continue
         if not (mark_y + 2 < y < mark_y + 120): continue
         d = abs(x - mark_x) * 0.5 + (y - mark_y)
@@ -85,15 +81,20 @@ def letter_sort_key(l):
     return idx if idx >= 0 else 999
 
 
-# ---------- Определение типа страницы ----------
-def detect_page_type(words, header_text):
-    """'plan' / 'section' / 'node' / 'unknown'."""
+# ---------- Тип страницы и обозначение разреза ----------
+def parse_section_designation(header_text):
+    m = re.search(r'([A-ZА-Яa-zа-я0-9]+)-([A-ZА-Яa-zа-я0-9]+)\s*\(\s*(\d+)\s*\)', header_text)
+    if m:
+        return m.group(1).upper(), m.group(2).upper(), m.group(3)
+    return None
+
+
+def detect_page_type(header_text):
+    if parse_section_designation(header_text):
+        return "section"
     h = header_text.lower()
     if "узел" in h or "detail" in h:
         return "node"
-    # Обозначение разреза: X-X (NN)
-    if re.search(r'\b\d+-\d+\s*\(\d+\)', header_text) or re.search(r'\b[A-ZА-Я]-[A-ZА-Я]\s*\(\d+\)', header_text):
-        return "section"
     if "разрез" in h:
         return "section"
     if "план" in h or "схема расположения" in h or "layout" in h:
@@ -101,17 +102,8 @@ def detect_page_type(words, header_text):
     return "unknown"
 
 
-def parse_section_designation(header_text):
-    """Из '1-1 (11)' или 'A-A (15)' → ('1','1','11') или ('A','A','15')."""
-    m = re.search(r'([A-ZА-Я0-9]+)-([A-ZА-Я0-9]+)\s*\((\d+)\)', header_text)
-    if m:
-        return m.group(1), m.group(2), m.group(3)
-    return None
-
-
-# ---------- Оси на ПЛАНЕ ----------
+# ---------- Планы: буквы в колонке, цифры в ряду ----------
 def find_letter_axes_plan(words):
-    """Вертикальные колонки одиночных букв."""
     items = [(t, x, y) for t, x, y in words if re.fullmatch(r'[A-ZА-Я]', t)]
     axes = []
     for g in cluster_by(items, 1, 12):
@@ -129,8 +121,27 @@ def find_letter_axes_plan(words):
     return axes
 
 
+def filter_digits_row(items):
+    """Оставляем только чистую последовательность 1,2,3... с равным шагом."""
+    items = sorted(items, key=lambda i: i[1])
+    if not items: return []
+    result = [items[0]]
+    for i in range(1, len(items)):
+        prev = result[-1]; curr = items[i]
+        try:
+            prev_n = int(prev[0]); curr_n = int(curr[0])
+        except ValueError:
+            break
+        if curr_n != prev_n + 1: break
+        if len(result) >= 2:
+            d_prev = result[-1][1] - result[-2][1]
+            d_curr = curr[1] - result[-1][1]
+            if abs(d_prev - d_curr) > d_prev * 0.3: break
+        result.append(curr)
+    return result if len(result) >= 2 else []
+
+
 def find_number_axes_plan(words):
-    """Горизонтальные ряды цифр 1-2-3 с равным шагом."""
     items = [(t, x, y) for t, x, y in words if re.fullmatch(r'\d{1,2}', t)]
     axes = []
     for g in cluster_by(items, 2, 6):
@@ -141,56 +152,40 @@ def find_number_axes_plan(words):
         for t, x, y in gs:
             if not clean or x - clean[-1][1] > 15:
                 clean.append((t, x, y))
-        if len(clean) < 3: continue
-        xs = [i[1] for i in clean]
-        if max(xs) - min(xs) < 100: continue
-        diffs = [xs[i+1] - xs[i] for i in range(len(xs)-1)]
-        if not diffs: continue
-        if max(diffs) - min(diffs) > max(diffs) * 0.5: continue
-        axes.append((sum(i[2] for i in clean)/len(clean),
-                     [(t, x) for t, x, _ in clean]))
+        filtered = filter_digits_row([(t, x) for t, x, _ in clean])
+        if len(filtered) < 2: continue
+        axes.append((sum(y for _, _, y in clean)/len(clean), filtered))
     return axes
 
 
-# ---------- Оси на РАЗРЕЗЕ ----------
-def find_letter_axes_section(words, page_height):
-    """Горизонтальные ряды одиночных букв в нижней части листа."""
+# ---------- Разрезы: буквы в нижнем ряду ----------
+def find_letters_in_section(words, whitelist_letters, page_height):
     items = [(t, x, y) for t, x, y in words
-             if re.fullmatch(r'[A-ZА-Я]', t) and y > page_height * 0.55]
-    rows = []
-    for g in cluster_by(items, 2, 15):
-        if len(g) < 2: continue
-        ys = [i[2] for i in g]; xs = [i[1] for i in g]
-        if max(ys) - min(ys) > 20: continue
-        if max(xs) - min(xs) < 80: continue
-        gs = sorted(g, key=lambda i: i[1])
-        rows.append((sum(ys)/len(ys), [(t, x) for t, x, _ in gs]))
-    return rows
+             if t in whitelist_letters and y > page_height * 0.7]
+    if not items: return []
+    # только одиночные буквы
+    items = [i for i in items if re.fullmatch(r'[A-ZА-Я]', i[0])]
+    # группируем по Y
+    items.sort(key=lambda i: i[2])
+    row = []
+    prev_y = None
+    for t, x, y in items:
+        if prev_y is None or abs(y - prev_y) < 30:
+            row.append((t, x, y))
+            prev_y = y
+        else:
+            break
+    return row
 
 
-def find_number_axes_section(words, page_height):
-    """Вертикальные колонки одиночных цифр в нижней части листа (если разрез по буквам)."""
-    items = [(t, x, y) for t, x, y in words
-             if re.fullmatch(r'\d{1,2}', t) and y > page_height * 0.55]
-    cols = []
-    for g in cluster_by(items, 1, 15):
-        if len(g) < 2: continue
-        xs = [i[1] for i in g]; ys = [i[2] for i in g]
-        if max(xs) - min(xs) > 20: continue
-        if max(ys) - min(ys) < 80: continue
-        gs = sorted(g, key=lambda i: i[2])
-        cols.append((sum(xs)/len(xs), [(t, y) for t, _, y in gs]))
-    return cols
-
-
-# ---------- Поиск осей относительно марки ----------
-def find_axis_letter_in_cols(letter_axes, x, y):
-    """Для плана: буквы в вертикальной колонке."""
+# ---------- Осевые вычисления ----------
+def find_axis_letter_in_cols(letter_axes, x, y, whitelist_letters):
     if not letter_axes: return None
     nearest_col = min(letter_axes, key=lambda la: abs(la[0] - x))
     col_x, col_items = nearest_col
     if abs(col_x - x) > 400: return None
-    items = sorted(col_items, key=lambda c: c[1])
+    items = sorted([c for c in col_items if c[0] in whitelist_letters], key=lambda c: c[1])
+    if len(items) < 2: return None
     above = [c for c in items if c[1] < y]
     below = [c for c in items if c[1] >= y]
     if not above and not below: return None
@@ -205,13 +200,13 @@ def find_axis_letter_in_cols(letter_axes, x, y):
     return f"{letters[0]}-{letters[1]}"
 
 
-def find_axis_number_in_rows(number_axes, x, y):
-    """Для плана: цифры в горизонтальном ряду."""
+def find_axis_number_in_rows(number_axes, x, y, whitelist_numbers):
     if not number_axes: return None
     nearest_row = min(number_axes, key=lambda na: abs(na[0] - y))
     row_y, row_items = nearest_row
     if abs(row_y - y) > 400: return None
-    items = sorted(row_items, key=lambda c: c[1])
+    items = sorted([c for c in row_items if c[0] in whitelist_numbers], key=lambda c: c[1])
+    if len(items) < 2: return None
     left = [c for c in items if c[1] < x]
     right = [c for c in items if c[1] >= x]
     if not left and not right: return None
@@ -229,27 +224,34 @@ def find_axis_number_in_rows(number_axes, x, y):
         return f"{a[0]}-{b[0]}"
 
 
-def find_axis_letter_in_rows(letter_rows, x, y):
-    """Для разреза: буквы в горизонтальном ряду (по X ближайшие)."""
-    if not letter_rows: return None
-    # Берём ближайший ряд по Y (хотя обычно он один)
-    row_y, row_items = min(letter_rows, key=lambda lr: abs(lr[0] - y))
-    if not row_items: return None
-    letters = sorted(set(t for t, _ in row_items), key=letter_sort_key)
-    if not letters: return None
-    if len(letters) == 1: return letters[0]
-    # Все буквы в ряду → диапазон (упрощённо)
-    return f"{letters[0]}-{letters[-1]}"
+def find_axis_letter_in_section(letters_row, x, whitelist_letters):
+    items = sorted([(t, x) for t, x, y in letters_row if t in whitelist_letters],
+                   key=lambda i: i[1])
+    if len(items) < 1: return None
+    if len(items) == 1: return items[0][0]
+    left = [c for c in items if c[1] < x]
+    right = [c for c in items if c[1] >= x]
+    if not left and not right: return None
+    if not left: return right[0][0]
+    if not right: return left[-1][0]
+    a = left[-1]; b = right[0]
+    d_a, d_b = x - a[1], b[1] - x
+    ratio = min(d_a, d_b) / max(d_a, d_b) if max(d_a, d_b) > 0 else 1
+    if ratio < 0.3:
+        return a[0] if d_a < d_b else b[0]
+    letters = sorted([a[0], b[0]], key=letter_sort_key)
+    return f"{letters[0]}-{letters[1]}"
 
 
-def find_axis_number_in_cols(number_cols, x, y):
-    """Для разреза: цифры в вертикальной колонке (если разрез по буквам)."""
-    if not number_cols: return None
-    col_x, col_items = min(number_cols, key=lambda nc: abs(nc[0] - x))
-    nums = sorted(set(t for t, _ in col_items), key=lambda n: int(n) if n.isdigit() else 999)
-    if not nums: return None
-    if len(nums) == 1: return nums[0]
-    return f"{nums[0]}-{nums[-1]}"
+def get_section_number(section_tuple, whitelist_numbers):
+    if not section_tuple: return None
+    a, b, _ = section_tuple
+    if a == b and a in whitelist_numbers:
+        return a
+    if a.isdigit() and b.isdigit() and a in whitelist_numbers and b in whitelist_numbers:
+        nums = sorted([a, b], key=int)
+        return f"{nums[0]}-{nums[1]}"
+    return None
 
 
 # ---------- Итоговая таблица ----------
@@ -258,13 +260,11 @@ def build_result_table(records):
     if df.empty: return df
 
     def extract_letters(val):
-        if not val or val == '?' or 'узел' in str(val) or 'разрез' in str(val):
-            return []
+        if not val or val == '?' or 'узел' in str(val): return []
         return [p.strip() for p in str(val).split('-') if p.strip()]
 
     def extract_numbers(val):
-        if not val or val == '?' or 'узел' in str(val) or 'разрез' in str(val):
-            return []
+        if not val or val == '?' or 'узел' in str(val): return []
         return [p.strip() for p in str(val).split('-') if p.strip()]
 
     def sort_elevs(lst):
@@ -282,43 +282,27 @@ def build_result_table(records):
     for mark in sorted(df['Марка'].unique(), key=mark_sort_key):
         group = df[df['Марка'] == mark]
         count = len(group)
-
-        plan_group = group[~group['Ось-буква'].astype(str).str.contains('узел|разрез', na=False)]
-        if plan_group.empty:
-            plan_group = group
+        plan_group = group[~group['Ось-буква'].astype(str).str.contains('узел', na=False)]
+        if plan_group.empty: plan_group = group
 
         all_letters = set()
-        for v in plan_group['Ось-буква']:
-            all_letters.update(extract_letters(v))
+        for v in plan_group['Ось-буква']: all_letters.update(extract_letters(v))
         sorted_letters = sorted(all_letters, key=letter_sort_key)
-        if len(sorted_letters) > 1:
-            let_str = f"{sorted_letters[0]}-{sorted_letters[-1]}"
-        elif sorted_letters:
-            let_str = sorted_letters[0]
-        else:
-            let_str = "?"
+        let_str = (f"{sorted_letters[0]}-{sorted_letters[-1]}" if len(sorted_letters) > 1
+                   else (sorted_letters[0] if sorted_letters else "?"))
 
         all_numbers = set()
-        for v in plan_group['Ось-цифра']:
-            all_numbers.update(extract_numbers(v))
+        for v in plan_group['Ось-цифра']: all_numbers.update(extract_numbers(v))
         def num_key(n):
             try: return int(n)
             except: return 999
         sorted_numbers = sorted(all_numbers, key=num_key)
-        if len(sorted_numbers) > 1:
-            num_str = f"{sorted_numbers[0]}-{sorted_numbers[-1]}"
-        elif sorted_numbers:
-            num_str = sorted_numbers[0]
-        else:
-            num_str = "?"
+        num_str = (f"{sorted_numbers[0]}-{sorted_numbers[-1]}" if len(sorted_numbers) > 1
+                   else (sorted_numbers[0] if sorted_numbers else "?"))
 
         elevs = sort_elevs([e for e in plan_group['Отм.'] if e != '?'])
-        if len(elevs) > 1:
-            elev_str = f"от {elevs[0]} до {elevs[-1]}"
-        elif elevs:
-            elev_str = elevs[0]
-        else:
-            elev_str = "?"
+        elev_str = (f"от {elevs[0]} до {elevs[-1]}" if len(elevs) > 1
+                    else (elevs[0] if elevs else "?"))
 
         summary = f"{let_str}/{num_str} в отм. {elev_str}"
 
@@ -341,11 +325,9 @@ def split_pdf(pdf_path, chunk_size=12):
     for start in range(0, total, chunk_size):
         end = min(start + chunk_size, total)
         writer = PdfWriter()
-        for i in range(start, end):
-            writer.add_page(reader.pages[i])
+        for i in range(start, end): writer.add_page(reader.pages[i])
         part_path = f"{pdf_path}.part_{start+1}_{end}.pdf"
-        with open(part_path, "wb") as f:
-            writer.write(f)
+        with open(part_path, "wb") as f: writer.write(f)
         parts.append((start + 1, end, part_path))
     return total, parts
 
@@ -353,19 +335,18 @@ def split_pdf(pdf_path, chunk_size=12):
 # ---------- Основная обработка ----------
 def process_pdf_by_chunks(pdf_path, status_slot=None):
     total, parts = split_pdf(pdf_path, chunk_size=12)
+    whitelist_letters = set()
+    whitelist_numbers = set()
     marks_set = set()
-    candidates = []
     skipped = []
 
-    mark_re = re.compile(r'^[A-ZА-Я]{1,4}-?\d{1,4}$')
-
+    # ---- Фаза 1: whitelist осей + марки ----
     for idx, (start, end, part_path) in enumerate(parts):
-        if status_slot is not None:
-            status_slot.info(f"⏳ Обрабатываю листы {start}–{end} из {total} (часть {idx+1}/{len(parts)})…")
+        if status_slot:
+            status_slot.info(f"⏳ Фаза 1/2 — анализ листов {start}–{end} из {total}")
         try:
             with pdfplumber.open(part_path) as pdf:
-                for local_idx, page in enumerate(pdf.pages):
-                    global_num = start + local_idx
+                for page in pdf.pages:
                     try:
                         tables = get_page_tables(page)
                         if page_has_mark_name(tables):
@@ -374,18 +355,62 @@ def process_pdf_by_chunks(pdf_path, status_slot=None):
                         del tables
 
                         words_raw = page.extract_words()
-                        if not words_raw:
-                            gc.collect(); continue
+                        if not words_raw: continue
+                        words = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
 
+                        header = " ".join(t for t, x, y in words if y < 150)
+                        ptype = detect_page_type(header)
+
+                        if ptype == "plan":
+                            for _, col in find_letter_axes_plan(words):
+                                for letter, _ in col: whitelist_letters.add(letter)
+                            for _, row in find_number_axes_plan(words):
+                                for num, _ in row: whitelist_numbers.add(num)
+
+                        del words
+                    except Exception: pass
+                    gc.collect()
+        except Exception as e:
+            skipped.append(f"часть {start}-{end}: {e}")
+        gc.collect()
+
+    # Fallback если планы не нашлись
+    if not whitelist_letters:
+        whitelist_letters = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    if not whitelist_numbers:
+        whitelist_numbers = set(str(i) for i in range(1, 30))
+
+    if status_slot:
+        status_slot.info(f"⏳ Оси проекта: буквы = {sorted(whitelist_letters)}, цифры = {sorted(whitelist_numbers)}")
+
+    # ---- Фаза 2: обработка ----
+    candidates = []
+    mark_re = re.compile(r'^[A-ZА-Я]{1,4}-?\d{1,4}$')
+
+    for idx, (start, end, part_path) in enumerate(parts):
+        if status_slot:
+            status_slot.info(f"⏳ Фаза 2/2 — обработка листов {start}–{end} из {total}")
+        try:
+            with pdfplumber.open(part_path) as pdf:
+                for local_idx, page in enumerate(pdf.pages):
+                    global_num = start + local_idx
+                    try:
+                        tables = get_page_tables(page)
+                        if page_has_mark_name(tables):
+                            del tables; gc.collect(); continue
+                        del tables
+
+                        words_raw = page.extract_words()
+                        if not words_raw: continue
                         words = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
                         del words_raw
 
-                        header_text = " ".join(t for t, x, y in words if y < 100)
-                        page_type = detect_page_type(words, header_text)
+                        header = " ".join(t for t, x, y in words if y < 150)
+                        ptype = detect_page_type(header)
                         page_elev = get_header_elev(words)
                         page_height = page.height
 
-                        if page_type == "node":
+                        if ptype == "node":
                             for t, x, y in words:
                                 if not mark_re.match(t): continue
                                 candidates.append({
@@ -395,44 +420,15 @@ def process_pdf_by_chunks(pdf_path, status_slot=None):
                                 })
                             del words; gc.collect(); continue
 
-                        if page_type == "section":
-                            # НОВОЕ: разрезы
-                            section = parse_section_designation(header_text)
-                            letter_rows = find_letter_axes_section(words, page_height)
-                            number_cols = find_number_axes_section(words, page_height)
-
-                            # Цифра по умолчанию — из обозначения разреза
-                            if section:
-                                sec_a, sec_b, _ = section
-                                if sec_a == sec_b:
-                                    num_default = sec_a if sec_a.isdigit() else "?"
-                                else:
-                                    try:
-                                        nums = sorted([sec_a, sec_b], key=lambda n: int(n) if n.isdigit() else 999)
-                                        num_default = f"{nums[0]}-{nums[1]}"
-                                    except Exception:
-                                        num_default = f"{sec_a}-{sec_b}"
-                                # Если разрез по буквам (A-A) — цифра потеряется, но мы её возьмём из колонки
-                                if not sec_a.isdigit():
-                                    num_default = None
-                            else:
-                                num_default = None
-
-                            # Буква по умолчанию — если обозначение буквенное
-                            let_default = None
-                            if section:
-                                sec_a, sec_b, _ = section
-                                if not sec_a.isdigit():
-                                    if sec_a == sec_b:
-                                        let_default = sec_a
-                                    else:
-                                        letters = sorted([sec_a, sec_b], key=letter_sort_key)
-                                        let_default = f"{letters[0]}-{letters[1]}"
+                        if ptype == "section":
+                            section = parse_section_designation(header)
+                            letters_row = find_letters_in_section(words, whitelist_letters, page_height)
+                            num_from_section = get_section_number(section, whitelist_numbers)
 
                             for t, x, y in words:
                                 if not mark_re.match(t): continue
-                                let = let_default or find_axis_letter_in_rows(letter_rows, x, y) or '?'
-                                num = num_default or find_axis_number_in_cols(number_cols, x, y) or '?'
+                                let = find_axis_letter_in_section(letters_row, x, whitelist_letters) or '?'
+                                num = num_from_section or '?'
                                 elev = find_near_elev(words, x, y) or page_elev or '?'
                                 candidates.append({
                                     'Лист': global_num, 'Марка': t,
@@ -441,14 +437,14 @@ def process_pdf_by_chunks(pdf_path, status_slot=None):
                                 })
                             del words; gc.collect(); continue
 
-                        # План или unknown — используем старую логику
+                        # план / unknown
                         letter_axes = find_letter_axes_plan(words)
                         number_axes = find_number_axes_plan(words)
 
                         for t, x, y in words:
                             if not mark_re.match(t): continue
-                            let = find_axis_letter_in_cols(letter_axes, x, y) or '?'
-                            num = find_axis_number_in_rows(number_axes, x, y) or '?'
+                            let = find_axis_letter_in_cols(letter_axes, x, y, whitelist_letters) or '?'
+                            num = find_axis_number_in_rows(number_axes, x, y, whitelist_numbers) or '?'
                             elev = find_near_elev(words, x, y) or page_elev or '?'
                             candidates.append({
                                 'Лист': global_num, 'Марка': t,
