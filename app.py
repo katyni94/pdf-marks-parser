@@ -9,7 +9,7 @@ import gc
 import os
 from pypdf import PdfReader, PdfWriter
 
-st.caption("Версия 7.0 — низкий порог для осей + безопасная диагностика")
+st.caption("Версия 8.0 — fallback на диапазон осей и отметок")
 
 
 # ---------- Утилиты ----------
@@ -31,6 +31,11 @@ def collapse_repeats(text):
     if 2 <= len(text) <= 4 and len(set(text)) == 1:
         return text[0]
     return text
+
+
+def elev_to_float(s):
+    try: return float(s.replace(',', '.').replace('+', ''))
+    except: return None
 
 
 def get_page_tables(page):
@@ -303,8 +308,9 @@ def combine_numbers(val, number_order):
     return val
 
 
-# ---------- Итоговая таблица ----------
-def build_result_table(records, letter_order, number_order):
+# ---------- Итоговая таблица (с fallback) ----------
+def build_result_table(records, letter_order, number_order,
+                       whitelist_letters, whitelist_numbers, all_elevs):
     df = pd.DataFrame(records)
     if df.empty: return df
 
@@ -322,6 +328,22 @@ def build_result_table(records, letter_order, number_order):
             except: return 99999
         return sorted(set(lst), key=k)
 
+    # Заготовки fallback
+    fallback_letters = (f"{whitelist_letters[0]}-{whitelist_letters[-1]}"
+                        if len(whitelist_letters) > 1
+                        else (whitelist_letters[0] if whitelist_letters else "?"))
+    fallback_numbers = (f"{whitelist_numbers[0]}-{whitelist_numbers[-1]}"
+                        if len(whitelist_numbers) > 1
+                        else (whitelist_numbers[0] if whitelist_numbers else "?"))
+
+    sorted_all_elevs = sort_elevs(all_elevs)
+    if len(sorted_all_elevs) > 1:
+        fallback_elev = f"от {sorted_all_elevs[0]} до {sorted_all_elevs[-1]}"
+    elif sorted_all_elevs:
+        fallback_elev = sorted_all_elevs[0]
+    else:
+        fallback_elev = "?"
+
     rows = []
     def mark_sort_key(m):
         parts = re.match(r'([A-ZА-Я]+)-?(\d+)', m)
@@ -337,18 +359,28 @@ def build_result_table(records, letter_order, number_order):
         all_letters = set()
         for v in plan_group['Ось-буква']: all_letters.update(extract_letters(v))
         sorted_letters = sorted(all_letters, key=lambda l: letter_order.get(l, 999))
-        let_str = (f"{sorted_letters[0]}-{sorted_letters[-1]}" if len(sorted_letters) > 1
-                   else (sorted_letters[0] if sorted_letters else "?"))
+        if sorted_letters:
+            let_str = (f"{sorted_letters[0]}-{sorted_letters[-1]}" if len(sorted_letters) > 1
+                       else sorted_letters[0])
+        else:
+            let_str = fallback_letters  # FALLBACK
 
         all_numbers = set()
         for v in plan_group['Ось-цифра']: all_numbers.update(extract_numbers(v))
         sorted_numbers = sorted(all_numbers, key=lambda n: number_order.get(n, 999))
-        num_str = (f"{sorted_numbers[0]}-{sorted_numbers[-1]}" if len(sorted_numbers) > 1
-                   else (sorted_numbers[0] if sorted_numbers else "?"))
+        if sorted_numbers:
+            num_str = (f"{sorted_numbers[0]}-{sorted_numbers[-1]}" if len(sorted_numbers) > 1
+                       else sorted_numbers[0])
+        else:
+            num_str = fallback_numbers  # FALLBACK
 
         elevs = sort_elevs([e for e in plan_group['Отм.'] if e != '?'])
-        elev_str = (f"от {elevs[0]} до {elevs[-1]}" if len(elevs) > 1
-                    else (elevs[0] if elevs else "?"))
+        if len(elevs) > 1:
+            elev_str = f"от {elevs[0]} до {elevs[-1]}"
+        elif elevs:
+            elev_str = elevs[0]
+        else:
+            elev_str = fallback_elev  # FALLBACK
 
         summary = f"{let_str}/{num_str} в отм. {elev_str}"
 
@@ -390,6 +422,7 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
     skipped = []
     candidates = []
     all_found_texts = set()
+    all_elevs = set()  # для fallback по отметкам
 
     for idx, (start, end, part_path) in enumerate(parts):
         if status_slot:
@@ -416,10 +449,15 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                         for t, x, y in words:
                             if re.match(r'^[A-ZА-Я0-9\-/]{3,}$', t):
                                 all_found_texts.add(t)
+                            # собираем все отметки для fallback
+                            if re.fullmatch(r'[+-]?\d+[.,]\d{2,3}', t):
+                                all_elevs.add(t.replace(',', '.'))
 
                         header = " ".join(t for t, x, y in words_for_axes if y < 150)
                         ptype = detect_page_type(header)
                         page_elev = get_header_elev(words_for_axes)
+                        if page_elev:
+                            all_elevs.add(page_elev)
                         page_height = page.height
 
                         if not marks_set:
@@ -499,7 +537,8 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
     if not records:
         return None, "Марки из ведомости не найдены на чертежах.", skipped, marks_set, pd.DataFrame(), all_found_texts
 
-    result = build_result_table(records, letter_order, number_order)
+    result = build_result_table(records, letter_order, number_order,
+                                whitelist_letters, whitelist_numbers, all_elevs)
     found_marks = set(r['Марка'] for r in records)
     missing = marks_set - found_marks
     missing_df = pd.DataFrame({'Пропавшие марки': sorted(missing)}) if missing else pd.DataFrame()
@@ -594,15 +633,6 @@ if search_clicked or show_clicked:
                     st.write(f"**Найдено слов по фильтру: {len(all_words)}** (первые 300):")
                     lines = [f"{t}\t(x={x}, y={y})" for t, x, y in all_words[:300]]
                     st.text("\n".join(lines) if lines else "(пусто)")
-
-                    singles = [(fix_enc(w['text']), round(w['x0']), round(w['top']))
-                               for w in words_raw
-                               if re.fullmatch(r'[A-ZА-Я0-9]', fix_enc(w['text']))]
-                    if diag_filter.strip():
-                        flt = diag_filter.strip().upper()
-                        singles = [x for x in singles if flt in x[0].upper()]
-                    st.write(f"**Одиночные символы: {len(singles)}** (первые 100):")
-                    st.text("\n".join([f"{t}\t(x={x}, y={y})" for t, x, y in singles[:100]]) if singles else "(пусто)")
                 else:
                     st.error(f"Листа {diag_page} нет в файле.")
 
