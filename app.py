@@ -9,7 +9,7 @@ import gc
 import os
 from pypdf import PdfReader, PdfWriter
 
-st.caption("Версия 8.0 — fallback на диапазон осей и отметок")
+st.caption("Версия 9.0 — финальная")
 
 
 # ---------- Утилиты ----------
@@ -31,11 +31,6 @@ def collapse_repeats(text):
     if 2 <= len(text) <= 4 and len(set(text)) == 1:
         return text[0]
     return text
-
-
-def elev_to_float(s):
-    try: return float(s.replace(',', '.').replace('+', ''))
-    except: return None
 
 
 def get_page_tables(page):
@@ -308,11 +303,10 @@ def combine_numbers(val, number_order):
     return val
 
 
-# ---------- Итоговая таблица (с fallback) ----------
+# ---------- Итоговая таблица (с fallback + ненайденные) ----------
 def build_result_table(records, letter_order, number_order,
-                       whitelist_letters, whitelist_numbers, all_elevs):
-    df = pd.DataFrame(records)
-    if df.empty: return df
+                       whitelist_letters, whitelist_numbers, all_elevs, marks_set):
+    df = pd.DataFrame(records) if records else pd.DataFrame()
 
     def extract_letters(val):
         if not val or val == '?' or 'узел' in str(val): return []
@@ -328,7 +322,6 @@ def build_result_table(records, letter_order, number_order,
             except: return 99999
         return sorted(set(lst), key=k)
 
-    # Заготовки fallback
     fallback_letters = (f"{whitelist_letters[0]}-{whitelist_letters[-1]}"
                         if len(whitelist_letters) > 1
                         else (whitelist_letters[0] if whitelist_letters else "?"))
@@ -344,54 +337,69 @@ def build_result_table(records, letter_order, number_order,
     else:
         fallback_elev = "?"
 
+    fallback_summary = f"{fallback_letters}/{fallback_numbers} в отм. {fallback_elev}"
+
     rows = []
     def mark_sort_key(m):
         parts = re.match(r'([A-ZА-Я]+)-?(\d+)', m)
         if parts: return (parts.group(1), int(parts.group(2)))
         return (m, 0)
 
-    for mark in sorted(df['Марка'].unique(), key=mark_sort_key):
-        group = df[df['Марка'] == mark]
-        count = len(group)
-        plan_group = group[~group['Ось-буква'].astype(str).str.contains('узел', na=False)]
-        if plan_group.empty: plan_group = group
+    if not df.empty:
+        for mark in sorted(df['Марка'].unique(), key=mark_sort_key):
+            group = df[df['Марка'] == mark]
+            count = len(group)
+            plan_group = group[~group['Ось-буква'].astype(str).str.contains('узел', na=False)]
+            if plan_group.empty: plan_group = group
 
-        all_letters = set()
-        for v in plan_group['Ось-буква']: all_letters.update(extract_letters(v))
-        sorted_letters = sorted(all_letters, key=lambda l: letter_order.get(l, 999))
-        if sorted_letters:
-            let_str = (f"{sorted_letters[0]}-{sorted_letters[-1]}" if len(sorted_letters) > 1
-                       else sorted_letters[0])
-        else:
-            let_str = fallback_letters  # FALLBACK
+            all_letters = set()
+            for v in plan_group['Ось-буква']: all_letters.update(extract_letters(v))
+            sorted_letters = sorted(all_letters, key=lambda l: letter_order.get(l, 999))
+            if sorted_letters:
+                let_str = (f"{sorted_letters[0]}-{sorted_letters[-1]}" if len(sorted_letters) > 1
+                           else sorted_letters[0])
+            else:
+                let_str = fallback_letters
 
-        all_numbers = set()
-        for v in plan_group['Ось-цифра']: all_numbers.update(extract_numbers(v))
-        sorted_numbers = sorted(all_numbers, key=lambda n: number_order.get(n, 999))
-        if sorted_numbers:
-            num_str = (f"{sorted_numbers[0]}-{sorted_numbers[-1]}" if len(sorted_numbers) > 1
-                       else sorted_numbers[0])
-        else:
-            num_str = fallback_numbers  # FALLBACK
+            all_numbers = set()
+            for v in plan_group['Ось-цифра']: all_numbers.update(extract_numbers(v))
+            sorted_numbers = sorted(all_numbers, key=lambda n: number_order.get(n, 999))
+            if sorted_numbers:
+                num_str = (f"{sorted_numbers[0]}-{sorted_numbers[-1]}" if len(sorted_numbers) > 1
+                           else sorted_numbers[0])
+            else:
+                num_str = fallback_numbers
 
-        elevs = sort_elevs([e for e in plan_group['Отм.'] if e != '?'])
-        if len(elevs) > 1:
-            elev_str = f"от {elevs[0]} до {elevs[-1]}"
-        elif elevs:
-            elev_str = elevs[0]
-        else:
-            elev_str = fallback_elev  # FALLBACK
+            elevs = sort_elevs([e for e in plan_group['Отм.'] if e != '?'])
+            if len(elevs) > 1:
+                elev_str = f"от {elevs[0]} до {elevs[-1]}"
+            elif elevs:
+                elev_str = elevs[0]
+            else:
+                elev_str = fallback_elev
 
-        summary = f"{let_str}/{num_str} в отм. {elev_str}"
+            summary = f"{let_str}/{num_str} в отм. {elev_str}"
 
-        for i, (_, r) in enumerate(group.iterrows()):
-            place = f"{r['Ось-буква']}/{r['Ось-цифра']} (лист {r['Лист']}) в отм. {r['Отм.']}"
+            for i, (_, r) in enumerate(group.iterrows()):
+                place = f"{r['Ось-буква']}/{r['Ось-цифра']} (лист {r['Лист']}) в отм. {r['Отм.']}"
+                rows.append({
+                    'Марка': mark,
+                    'Найдено, шт': count if i == 0 else '',
+                    'Место': place,
+                    'Сводка (от-до)': summary if i == 0 else '',
+                })
+
+    if marks_set:
+        found_marks = set(df['Марка'].unique()) if not df.empty else set()
+        not_found = marks_set - found_marks
+        for mark in sorted(not_found, key=mark_sort_key):
             rows.append({
                 'Марка': mark,
-                'Найдено, шт': count if i == 0 else '',
-                'Место': place,
-                'Сводка (от-до)': summary if i == 0 else '',
+                'Найдено, шт': 0,
+                'Место': 'не найдено на чертежах',
+                'Сводка (от-до)': fallback_summary,
             })
+
     return pd.DataFrame(rows)
 
 
@@ -421,8 +429,7 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
     marks_set = set()
     skipped = []
     candidates = []
-    all_found_texts = set()
-    all_elevs = set()  # для fallback по отметкам
+    all_elevs = set()
 
     for idx, (start, end, part_path) in enumerate(parts):
         if status_slot:
@@ -447,9 +454,6 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                         del words_raw
 
                         for t, x, y in words:
-                            if re.match(r'^[A-ZА-Я0-9\-/]{3,}$', t):
-                                all_found_texts.add(t)
-                            # собираем все отметки для fallback
                             if re.fullmatch(r'[+-]?\d+[.,]\d{2,3}', t):
                                 all_elevs.add(t.replace(',', '.'))
 
@@ -502,7 +506,6 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                                 })
                             del words, words_for_axes; gc.collect(); continue
 
-                        # план / unknown
                         letter_axes = find_letter_axes_plan(words_for_axes, wl_letters_set)
                         number_axes = find_number_axes_plan(words_for_axes, wl_numbers_set)
 
@@ -531,21 +534,17 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
         gc.collect()
 
     if not marks_set:
-        return None, "Не найдено таблиц с MARK NAME.", skipped, set(), pd.DataFrame(), all_found_texts
+        return None, "Не найдено таблиц с MARK NAME."
 
-    records = candidates
-    if not records:
-        return None, "Марки из ведомости не найдены на чертежах.", skipped, marks_set, pd.DataFrame(), all_found_texts
-
-    result = build_result_table(records, letter_order, number_order,
-                                whitelist_letters, whitelist_numbers, all_elevs)
-    found_marks = set(r['Марка'] for r in records)
-    missing = marks_set - found_marks
-    missing_df = pd.DataFrame({'Пропавшие марки': sorted(missing)}) if missing else pd.DataFrame()
-
+    result = build_result_table(candidates, letter_order, number_order,
+                                whitelist_letters, whitelist_numbers, all_elevs,
+                                marks_set)
+    found_marks = set(r['Марка'] for r in candidates)
     msg = (f"Готово. Листов: {total}, марок в ведомости: {len(marks_set)}, "
-           f"найдено марок: {len(found_marks)}, вхождений: {len(records)}.")
-    return result, msg, skipped, missing, missing_df, all_found_texts
+           f"найдено на чертежах: {len(found_marks)}, вхождений: {len(candidates)}.")
+    if skipped:
+        msg += f" Пропущено листов: {len(skipped)}."
+    return result, msg
 
 
 # ---------- UI ----------
@@ -566,79 +565,6 @@ whitelist_numbers = [x.strip().upper() for x in re.split(r'[,\n;]+', numbers_inp
 
 uploaded = st.file_uploader("Выберите PDF-файл", type=["pdf"])
 
-# ---------- ДИАГНОСТИКА ----------
-st.markdown("---")
-st.subheader("🔎 Диагностика")
-
-diag_mark = st.text_input("Найти текст (подстрока)", value="B-106")
-diag_page = st.number_input("Номер листа", min_value=1, max_value=300, value=25, step=1)
-diag_filter = st.text_input("Фильтр слов на листе (подстрока, пусто = все)", value="B-10")
-
-col_d1, col_d2 = st.columns(2)
-search_clicked = col_d1.button("🔎 Найти по всем листам")
-show_clicked = col_d2.button("🖨 Показать лист")
-
-if search_clicked or show_clicked:
-    if uploaded is None:
-        st.warning("Сначала загрузи PDF.")
-    else:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-            tmp.write(uploaded.read())
-            pdf_path = tmp.name
-
-        with pdfplumber.open(pdf_path) as pdf:
-            if search_clicked:
-                target = normalize_text(diag_mark.strip()).upper()
-                st.write(f"**Поиск подстроки '{target}':**")
-                found_count = 0
-                for i, page in enumerate(pdf.pages):
-                    words_raw = page.extract_words()
-                    if not words_raw: continue
-                    raw_hits = []
-                    for w in words_raw:
-                        t = fix_enc(w['text'])
-                        if target in normalize_text(t).upper():
-                            raw_hits.append(t)
-                    merged = merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5)
-                    merged_hits = [t for t, x, y in merged
-                                   if target in normalize_text(t).upper()]
-                    if raw_hits or merged_hits:
-                        found_count += 1
-                        st.write(f"• **Лист {i+1}**: сырых={len(raw_hits)}, склеенных={len(merged_hits)}")
-                        if raw_hits:
-                            st.write(f"    сырые: {raw_hits[:5]}")
-                        if merged_hits:
-                            st.write(f"    склеенные: {merged_hits[:5]}")
-                if found_count == 0:
-                    st.warning(f"'{target}' нигде не найдено.")
-
-            if show_clicked:
-                idx = diag_page - 1
-                if 0 <= idx < len(pdf.pages):
-                    page = pdf.pages[idx]
-                    words_raw = page.extract_words()
-                    st.write(f"**Лист {diag_page}: {len(words_raw)} слов.**")
-
-                    all_words = []
-                    for w in words_raw:
-                        t = fix_enc(w['text'])
-                        all_words.append((t, round(w['x0']), round(w['top'])))
-
-                    if diag_filter.strip():
-                        flt = diag_filter.strip().upper()
-                        all_words = [x for x in all_words if flt in x[0].upper()]
-
-                    all_words.sort(key=lambda x: x[0].upper())
-
-                    st.write(f"**Найдено слов по фильтру: {len(all_words)}** (первые 300):")
-                    lines = [f"{t}\t(x={x}, y={y})" for t, x, y in all_words[:300]]
-                    st.text("\n".join(lines) if lines else "(пусто)")
-                else:
-                    st.error(f"Листа {diag_page} нет в файле.")
-
-# ---------- ОСНОВНАЯ ОБРАБОТКА ----------
-st.markdown("---")
-
 if uploaded is not None:
     if not whitelist_letters or not whitelist_numbers:
         st.warning("Заполните оба поля с осями.")
@@ -652,7 +578,7 @@ if uploaded is not None:
                 xlsx_path = pdf_path.replace('.pdf', '.xlsx')
 
                 status.info("⏳ Начинаю обработку…")
-                result, msg, skipped, missing, missing_df, all_found = process_pdf_by_chunks(
+                result, msg = process_pdf_by_chunks(
                     pdf_path, whitelist_letters, whitelist_numbers, status)
                 status.empty()
 
@@ -660,20 +586,7 @@ if uploaded is not None:
                     st.error(msg)
                 else:
                     st.success(msg)
-                    if skipped:
-                        st.warning("Пропущенные листы: " + "; ".join(skipped[:10]))
-                    if missing:
-                        st.warning(
-                            f"**Не найдено: {len(missing)} марок.** "
-                            f"Первые 30: " + ", ".join(sorted(missing)[:30])
-                        )
-                    with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
-                        result.to_excel(writer, sheet_name='Марки', index=False)
-                        if not missing_df.empty:
-                            missing_df.to_excel(writer, sheet_name='Не найдено', index=False)
-                        if all_found:
-                            pd.DataFrame({'Найдено в PDF': sorted(all_found)}).to_excel(
-                                writer, sheet_name='Все тексты марок', index=False)
+                    result.to_excel(xlsx_path, index=False)
                     with open(xlsx_path, "rb") as f:
                         st.download_button(
                             label="⬇️ Скачать Excel",
