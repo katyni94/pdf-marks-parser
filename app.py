@@ -9,7 +9,7 @@ import gc
 import os
 from pypdf import PdfReader, PdfWriter
 
-st.caption("Версия 9.0 — финальная")
+st.caption("Версия 10.0 — сокращение марок + защита от падения")
 
 
 # ---------- Утилиты ----------
@@ -33,6 +33,28 @@ def collapse_repeats(text):
     return text
 
 
+# ---------- Сокращение марок ----------
+REDUCE_REGEX = re.compile(r'[-_]([A-ZА-Я]{1,4})-?0*(\d+)\s*$')
+
+def reduce_mark(mark):
+    """Из 'NZTM-128-21-ST-401-KMD1.5-B0001' делает 'B-1'.
+    Если не подходит — возвращает исходное."""
+    if not mark: return mark
+    m = REDUCE_REGEX.search(mark.strip())
+    if not m: return mark.strip()
+    letters, digits = m.group(1), m.group(2)
+    return f"{letters}-{int(digits)}"
+
+
+def reduce_marks_set(marks_set):
+    """Применяет сокращение ко всем маркам. Схлопывает дубликаты."""
+    result = set()
+    for m in marks_set:
+        result.add(reduce_mark(m))
+    return result
+
+
+# ---------- Таблицы ----------
 def get_page_tables(page):
     try: return page.extract_tables()
     except Exception: return []
@@ -59,7 +81,7 @@ def extract_marks_from_tables(tables):
     return found
 
 
-# ---------- Нечёткое сопоставление марки ----------
+# ---------- Нечёткое сопоставление ----------
 def build_mark_lookup(marks_set):
     marks_by_len = {}
     all_marks = set()
@@ -76,7 +98,6 @@ def match_mark(text, marks_by_len, all_marks):
     if not t: return None
 
     if t in all_marks: return t
-
     t_rev = t[::-1]
     if t_rev in all_marks: return t_rev
 
@@ -128,10 +149,9 @@ def cluster_by(items, axis_idx, tol):
     return groups
 
 
-# ---------- Склейка разбитых слов ----------
+# ---------- Склейка ----------
 def merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5):
-    if not words_raw:
-        return []
+    if not words_raw: return []
     items = sorted(words_raw, key=lambda w: (round(w['top'], 1), w['x0']))
     merged = []
     cur = dict(items[0])
@@ -156,15 +176,11 @@ def parse_section_designation(header_text):
 
 
 def detect_page_type(header_text):
-    if parse_section_designation(header_text):
-        return "section"
+    if parse_section_designation(header_text): return "section"
     h = header_text.lower()
-    if "узел" in h or "detail" in h:
-        return "node"
-    if "разрез" in h:
-        return "section"
-    if "план" in h or "схема расположения" in h or "layout" in h:
-        return "plan"
+    if "узел" in h or "detail" in h: return "node"
+    if "разрез" in h: return "section"
+    if "план" in h or "схема расположения" in h or "layout" in h: return "plan"
     return "unknown"
 
 
@@ -180,8 +196,7 @@ def find_letter_axes_plan(words, wl_letters):
         gs = sorted(g, key=lambda i: i[2])
         clean = []
         for t, x, y in gs:
-            if not clean or y - clean[-1][2] > 20:
-                clean.append((t, x, y))
+            if not clean or y - clean[-1][2] > 20: clean.append((t, x, y))
         if len(clean) < 2: continue
         axes.append((sum(xs)/len(xs), [(t, y) for t, _, y in clean]))
     return axes
@@ -196,8 +211,7 @@ def find_number_axes_plan(words, wl_numbers):
         gs = sorted(g, key=lambda i: i[1])
         clean = []
         for t, x, y in gs:
-            if not clean or x - clean[-1][1] > 15:
-                clean.append((t, x, y))
+            if not clean or x - clean[-1][1] > 15: clean.append((t, x, y))
         if len(clean) < 2: continue
         xs = [i[1] for i in clean]
         if max(xs) - min(xs) < 100: continue
@@ -215,10 +229,8 @@ def find_letters_in_section(words, wl_letters, page_height):
     prev_y = None
     for t, x, y in items:
         if prev_y is None or abs(y - prev_y) < 40:
-            row.append((t, x, y))
-            prev_y = y
-        else:
-            break
+            row.append((t, x, y)); prev_y = y
+        else: break
     return row
 
 
@@ -239,8 +251,7 @@ def nearest_in_col(letter_axes, x, y):
     max_d = max(d_a, d_b)
     if max_d == 0: return a[0]
     ratio = min(d_a, d_b) / max_d
-    if ratio < 0.3:
-        return a[0] if d_a < d_b else b[0]
+    if ratio < 0.3: return a[0] if d_a < d_b else b[0]
     return [a[0], b[0]]
 
 
@@ -261,8 +272,7 @@ def nearest_in_row(number_axes, x, y):
     max_d = max(d_a, d_b)
     if max_d == 0: return a[0]
     ratio = min(d_a, d_b) / max_d
-    if ratio < 0.3:
-        return a[0] if d_a < d_b else b[0]
+    if ratio < 0.3: return a[0] if d_a < d_b else b[0]
     return [a[0], b[0]]
 
 
@@ -280,8 +290,7 @@ def nearest_in_letters_row(letters_row, x):
     max_d = max(d_a, d_b)
     if max_d == 0: return a[0]
     ratio = min(d_a, d_b) / max_d
-    if ratio < 0.3:
-        return a[0] if d_a < d_b else b[0]
+    if ratio < 0.3: return a[0] if d_a < d_b else b[0]
     return [a[0], b[0]]
 
 
@@ -303,7 +312,7 @@ def combine_numbers(val, number_order):
     return val
 
 
-# ---------- Итоговая таблица (с fallback + ненайденные) ----------
+# ---------- Итоговая таблица ----------
 def build_result_table(records, letter_order, number_order,
                        whitelist_letters, whitelist_numbers, all_elevs, marks_set):
     df = pd.DataFrame(records) if records else pd.DataFrame()
@@ -404,7 +413,7 @@ def build_result_table(records, letter_order, number_order,
 
 
 # ---------- Разбиение PDF ----------
-def split_pdf(pdf_path, chunk_size=12):
+def split_pdf(pdf_path, chunk_size=8):
     reader = PdfReader(pdf_path)
     total = len(reader.pages)
     parts = []
@@ -418,22 +427,50 @@ def split_pdf(pdf_path, chunk_size=12):
     return total, parts
 
 
-# ---------- Основная обработка ----------
-def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status_slot=None):
+# ---------- Проход 1: собрать whitelist ----------
+def collect_whitelist(pdf_path, status_slot=None):
+    total, parts = split_pdf(pdf_path, chunk_size=8)
+    marks_raw = set()
+    for idx, (start, end, part_path) in enumerate(parts):
+        if status_slot:
+            status_slot.info(f"⏳ Этап 1/2 — читаю ведомость: листы {start}–{end}")
+        try:
+            with pdfplumber.open(part_path) as pdf:
+                for page in pdf.pages:
+                    try:
+                        tables = get_page_tables(page)
+                        if page_has_mark_name(tables):
+                            marks_raw |= extract_marks_from_tables(tables)
+                        del tables
+                    except Exception:
+                        pass
+                    gc.collect()
+        finally:
+            try: os.unlink(part_path)
+            except: pass
+        gc.collect()
+    return marks_raw
+
+
+# ---------- Проход 2: обработка чертежей ----------
+def process_drawings(pdf_path, whitelist_letters, whitelist_numbers,
+                     marks_set, status_slot=None):
     letter_order = {l: i for i, l in enumerate(whitelist_letters)}
     number_order = {n: i for i, n in enumerate(whitelist_numbers)}
     wl_letters_set = set(whitelist_letters)
     wl_numbers_set = set(whitelist_numbers)
 
-    total, parts = split_pdf(pdf_path, chunk_size=12)
-    marks_set = set()
+    total, parts = split_pdf(pdf_path, chunk_size=8)
     skipped = []
     candidates = []
     all_elevs = set()
+    MAX_WORDS_PER_PAGE = 6000
+
+    marks_by_len, all_marks = build_mark_lookup(marks_set)
 
     for idx, (start, end, part_path) in enumerate(parts):
         if status_slot:
-            status_slot.info(f"⏳ Обрабатываю листы {start}–{end} из {total} (часть {idx+1}/{len(parts)})")
+            status_slot.info(f"⏳ Этап 2/2 — обрабатываю листы {start}–{end} из {total}")
         try:
             with pdfplumber.open(part_path) as pdf:
                 for local_idx, page in enumerate(pdf.pages):
@@ -441,12 +478,14 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                     try:
                         tables = get_page_tables(page)
                         if page_has_mark_name(tables):
-                            marks_set |= extract_marks_from_tables(tables)
                             del tables; gc.collect(); continue
                         del tables
 
                         words_raw = page.extract_words()
                         if not words_raw: continue
+                        if len(words_raw) > MAX_WORDS_PER_PAGE:
+                            skipped.append(f"лист {global_num}: слишком много слов ({len(words_raw)})")
+                            del words_raw; gc.collect(); continue
 
                         words_for_axes = [(fix_enc(collapse_repeats(w['text'])), w['x0'], w['top'])
                                           for w in words_raw]
@@ -460,14 +499,8 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                         header = " ".join(t for t, x, y in words_for_axes if y < 150)
                         ptype = detect_page_type(header)
                         page_elev = get_header_elev(words_for_axes)
-                        if page_elev:
-                            all_elevs.add(page_elev)
+                        if page_elev: all_elevs.add(page_elev)
                         page_height = page.height
-
-                        if not marks_set:
-                            del words, words_for_axes; gc.collect(); continue
-
-                        marks_by_len, all_marks = build_mark_lookup(marks_set)
 
                         if ptype == "node":
                             for t, x, y in words:
@@ -533,18 +566,7 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
             except: pass
         gc.collect()
 
-    if not marks_set:
-        return None, "Не найдено таблиц с MARK NAME."
-
-    result = build_result_table(candidates, letter_order, number_order,
-                                whitelist_letters, whitelist_numbers, all_elevs,
-                                marks_set)
-    found_marks = set(r['Марка'] for r in candidates)
-    msg = (f"Готово. Листов: {total}, марок в ведомости: {len(marks_set)}, "
-           f"найдено на чертежах: {len(found_marks)}, вхождений: {len(candidates)}.")
-    if skipped:
-        msg += f" Пропущено листов: {len(skipped)}."
-    return result, msg
+    return candidates, all_elevs, skipped, letter_order, number_order
 
 
 # ---------- UI ----------
@@ -554,11 +576,19 @@ st.write(
     "**Впишите оси проекта** — парсер найдёт только их."
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    letters_input = st.text_input("Буквенные оси (через запятую)", value="A, B, C, D, E, F")
-with col2:
-    numbers_input = st.text_input("Цифровые оси (через запятую)", value="1, 2, 3")
+with st.expander("⚙️ Настройки", expanded=True):
+    col1, col2 = st.columns(2)
+    with col1:
+        letters_input = st.text_input("Буквенные оси (через запятую)", value="A, B, C, D, E, F")
+    with col2:
+        numbers_input = st.text_input("Цифровые оси (через запятую)", value="1, 2, 3")
+
+    reduce_enabled = st.checkbox(
+        "Сокращать длинные марки из ведомости",
+        value=True,
+        help="Например, NZTM-128-21-ST-401-KMD1.5-B0001 → B-1. Отключите, если в вашей ведомости "
+             "уже короткие марки вида B-1."
+    )
 
 whitelist_letters = [x.strip().upper() for x in re.split(r'[,\n;]+', letters_input) if x.strip()]
 whitelist_numbers = [x.strip().upper() for x in re.split(r'[,\n;]+', numbers_input) if x.strip()]
@@ -577,15 +607,48 @@ if uploaded is not None:
                     pdf_path = tmp.name
                 xlsx_path = pdf_path.replace('.pdf', '.xlsx')
 
-                status.info("⏳ Начинаю обработку…")
-                result, msg = process_pdf_by_chunks(
-                    pdf_path, whitelist_letters, whitelist_numbers, status)
-                status.empty()
+                # === Этап 1: whitelist ===
+                status.info("⏳ Этап 1/2 — читаю ведомость марок…")
+                marks_raw = collect_whitelist(pdf_path, status)
 
-                if result is None:
-                    st.error(msg)
+                if not marks_raw:
+                    status.empty()
+                    st.error("В файле не найдены таблицы с колонкой MARK NAME. "
+                             "Проверьте, что ведомость марок есть в этом PDF.")
                 else:
+                    # Сокращение
+                    if reduce_enabled:
+                        marks_set = reduce_marks_set(marks_raw)
+                    else:
+                        marks_set = set(m.strip().upper() for m in marks_raw)
+
+                    # Показать примеры сокращения
+                    sample_raw = sorted(marks_raw)[:5]
+                    sample_red = [reduce_mark(m) for m in sample_raw] if reduce_enabled else sample_raw
+                    examples = "\n".join([f"   {a}  →  {b}" for a, b in zip(sample_raw, sample_red)])
+                    st.info(
+                        f"📋 Найдено марок в ведомости: **{len(marks_raw)}**\n"
+                        f"После обработки: **{len(marks_set)}** уникальных.\n\n"
+                        f"Примеры:\n```\n{examples}\n```"
+                    )
+
+                    # === Этап 2: чертежи ===
+                    candidates, all_elevs, skipped, letter_order, number_order = process_drawings(
+                        pdf_path, whitelist_letters, whitelist_numbers, marks_set, status)
+                    status.empty()
+
+                    result = build_result_table(
+                        candidates, letter_order, number_order,
+                        whitelist_letters, whitelist_numbers, all_elevs, marks_set)
+
+                    found_marks = set(r['Марка'] for r in candidates)
+                    msg = (f"✅ Готово. Марок в ведомости: {len(marks_set)}, "
+                           f"найдено на чертежах: {len(found_marks)}, "
+                           f"вхождений: {len(candidates)}.")
+                    if skipped:
+                        msg += f" Пропущено листов: {len(skipped)}."
                     st.success(msg)
+
                     result.to_excel(xlsx_path, index=False)
                     with open(xlsx_path, "rb") as f:
                         st.download_button(
