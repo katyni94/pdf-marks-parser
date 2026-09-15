@@ -1,5 +1,4 @@
 import streamlit as st
-
 st.set_page_config(page_title="Парсер марок из PDF", layout="wide")
 
 import pdfplumber
@@ -7,8 +6,10 @@ import re
 import pandas as pd
 import tempfile
 import gc
+import os
 
 
+# ---------- Вспомогательные функции (без изменений) ----------
 def fix_enc(s):
     if s is None: return ""
     try: return s.encode('latin-1').decode('cp1251')
@@ -31,16 +32,12 @@ def page_has_mark_name(tables):
     return False
 
 
-def collect_white_list(pdf, status_slot):
+def collect_white_list(pdf):
     marks = set()
-    total = len(pdf.pages)
-    for i, page in enumerate(pdf.pages):
-        status_slot.info(f"Этап 1/2 — поиск ведомости: лист {i+1} из {total}")
+    for page in pdf.pages:
         tables = get_page_tables(page)
         if not page_has_mark_name(tables):
-            del tables
-            gc.collect()
-            continue
+            del tables; gc.collect(); continue
         for t in tables:
             if not t or not t[0]: continue
             h = [(x or "").strip().upper() for x in t[0]]
@@ -49,8 +46,7 @@ def collect_white_list(pdf, status_slot):
             for row in t[2:]:
                 if row and len(row) > cm and row[cm]:
                     marks.add(row[cm].strip())
-        del tables
-        gc.collect()
+        del tables; gc.collect()
     return marks
 
 
@@ -148,13 +144,11 @@ def build_result_table(records):
 
     def sort_letters(lst):
         return sorted(set(lst), key=letter_sort_key)
-
     def sort_numbers(lst):
         def k(x):
             try: return int(x)
             except: return 999
         return sorted(set(lst), key=k)
-
     def sort_elevs(lst):
         def k(x):
             try: return float(x.replace(',', '.').replace('+', ''))
@@ -192,40 +186,32 @@ def build_result_table(records):
     return pd.DataFrame(rows)
 
 
-def process_pdf(pdf_path, status_slot):
+# ---------- Основная обработка ----------
+def process_pdf(pdf_path):
     records = []
     skipped = []
-
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
-
-        status_slot.info("Этап 1/2 — поиск ведомости марок…")
-        marks_set = collect_white_list(pdf, status_slot)
+        marks_set = collect_white_list(pdf)
         if not marks_set:
             return None, "Не найдено таблиц с MARK NAME.", skipped
 
         for idx, page in enumerate(pdf.pages):
-            status_slot.info(f"Этап 2/2 — обработка листа {idx+1} из {total}")
             try:
                 tables = get_page_tables(page)
                 if page_has_mark_name(tables):
-                    del tables
-                    gc.collect()
-                    continue
+                    del tables; gc.collect(); continue
                 del tables
 
                 words_raw = page.extract_words()
                 if not words_raw:
-                    gc.collect()
-                    continue
+                    gc.collect(); continue
 
                 words = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
                 del words_raw
 
                 if not any(t in marks_set for t, _, _ in words):
-                    del words
-                    gc.collect()
-                    continue
+                    del words; gc.collect(); continue
 
                 page_elev = get_header_elev(words)
                 letter_axes = find_letter_axes(words)
@@ -257,27 +243,28 @@ def process_pdf(pdf_path, status_slot):
 st.title("🏗️ Парсер марок из PDF-чертежей")
 st.write(
     "Загрузите PDF с ведомостью марок и чертежами. "
-    "Приложение найдёт каждую марку, её оси и отметку, и вернёт Excel-файл."
+    "Обработка занимает 2–5 минут — **не обновляйте страницу во время работы**."
 )
 
 uploaded = st.file_uploader("Выберите PDF-файл", type=["pdf"])
 
 if uploaded is not None:
     if st.button("▶ Обработать", type="primary"):
-        # Единый слот для статуса — без накопления DOM-элементов
-        status_slot = st.empty()
+        # Один статичный статус, без прогресс-бара и спиннера
+        status = st.info("⏳ Обрабатываю PDF... Это может занять 2–5 минут. Не закрывайте вкладку.")
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
                 tmp.write(uploaded.read())
                 pdf_path = tmp.name
             xlsx_path = pdf_path.replace('.pdf', '.xlsx')
 
-            result, msg, skipped = process_pdf(pdf_path, status_slot)
-            status_slot.empty()
+            result, msg, skipped = process_pdf(pdf_path)
 
             if result is None:
+                status.empty()
                 st.error(msg)
             else:
+                status.empty()
                 st.success(msg)
                 if skipped:
                     st.warning("Часть листов пропущена: " + "; ".join(skipped[:10]))
@@ -290,5 +277,5 @@ if uploaded is not None:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
         except Exception as e:
-            status_slot.empty()
+            status.empty()
             st.error(f"Ошибка обработки: {e}")
