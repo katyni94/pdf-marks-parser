@@ -7,9 +7,10 @@ import pandas as pd
 import tempfile
 import gc
 import os
+from pypdf import PdfReader, PdfWriter
 
 
-# ---------- Вспомогательные функции (без изменений) ----------
+# ---------- Утилиты ----------
 def fix_enc(s):
     if s is None: return ""
     try: return s.encode('latin-1').decode('cp1251')
@@ -32,22 +33,18 @@ def page_has_mark_name(tables):
     return False
 
 
-def collect_white_list(pdf):
-    marks = set()
-    for page in pdf.pages:
-        tables = get_page_tables(page)
-        if not page_has_mark_name(tables):
-            del tables; gc.collect(); continue
-        for t in tables:
-            if not t or not t[0]: continue
-            h = [(x or "").strip().upper() for x in t[0]]
-            if "MARK NAME" not in h: continue
-            cm = h.index("MARK NAME")
-            for row in t[2:]:
-                if row and len(row) > cm and row[cm]:
-                    marks.add(row[cm].strip())
-        del tables; gc.collect()
-    return marks
+def extract_marks_from_tables(tables):
+    """Возвращает множество марок из таблиц с MARK NAME."""
+    found = set()
+    for t in tables:
+        if not t or not t[0]: continue
+        h = [(x or "").strip().upper() for x in t[0]]
+        if "MARK NAME" not in h: continue
+        cm = h.index("MARK NAME")
+        for row in t[2:]:
+            if row and len(row) > cm and row[cm]:
+                found.add(row[cm].strip())
+    return found
 
 
 def get_header_elev(words):
@@ -186,53 +183,89 @@ def build_result_table(records):
     return pd.DataFrame(rows)
 
 
-# ---------- Основная обработка ----------
-def process_pdf(pdf_path):
-    records = []
+# ---------- Разбиение PDF на части ----------
+def split_pdf(pdf_path, chunk_size=12):
+    """Разбивает PDF. Возвращает (всего_страниц, [(start, end, path), ...])."""
+    reader = PdfReader(pdf_path)
+    total = len(reader.pages)
+    parts = []
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        writer = PdfWriter()
+        for i in range(start, end):
+            writer.add_page(reader.pages[i])
+        part_path = f"{pdf_path}.part_{start+1}_{end}.pdf"
+        with open(part_path, "wb") as f:
+            writer.write(f)
+        parts.append((start + 1, end, part_path))
+    return total, parts
+
+
+# ---------- Основная обработка по частям ----------
+def process_pdf_by_chunks(pdf_path, status_slot=None):
+    total, parts = split_pdf(pdf_path, chunk_size=12)
+    marks_set = set()
+    candidates = []
     skipped = []
-    with pdfplumber.open(pdf_path) as pdf:
-        total = len(pdf.pages)
-        marks_set = collect_white_list(pdf)
-        if not marks_set:
-            return None, "Не найдено таблиц с MARK NAME.", skipped
 
-        for idx, page in enumerate(pdf.pages):
-            try:
-                tables = get_page_tables(page)
-                if page_has_mark_name(tables):
-                    del tables; gc.collect(); continue
-                del tables
+    mark_re = re.compile(r'^[A-ZА-Я]{1,4}-?\d{1,4}$')
 
-                words_raw = page.extract_words()
-                if not words_raw:
-                    gc.collect(); continue
+    for idx, (start, end, part_path) in enumerate(parts):
+        if status_slot is not None:
+            status_slot.info(f"⏳ Обрабатываю листы {start}–{end} из {total} (часть {idx+1}/{len(parts)})…")
+        try:
+            with pdfplumber.open(part_path) as pdf:
+                for local_idx, page in enumerate(pdf.pages):
+                    global_num = start + local_idx
+                    try:
+                        tables = get_page_tables(page)
+                        if page_has_mark_name(tables):
+                            marks_set |= extract_marks_from_tables(tables)
+                            del tables
+                            gc.collect()
+                            continue
+                        del tables
 
-                words = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
-                del words_raw
+                        words_raw = page.extract_words()
+                        if not words_raw:
+                            gc.collect()
+                            continue
 
-                if not any(t in marks_set for t, _, _ in words):
-                    del words; gc.collect(); continue
+                        words = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
+                        del words_raw
 
-                page_elev = get_header_elev(words)
-                letter_axes = find_letter_axes(words)
-                number_axes = find_number_axes(words)
+                        page_elev = get_header_elev(words)
+                        letter_axes = find_letter_axes(words)
+                        number_axes = find_number_axes(words)
 
-                for t, x, y in words:
-                    if t not in marks_set: continue
-                    let = nearest_letter(letter_axes, x, y)
-                    num = nearest_number(number_axes, x, y)
-                    records.append({
-                        'Лист': idx + 1, 'Марка': t,
-                        'Ось-буква': let or '?', 'Ось-цифра': num or '?',
-                        'Отм.': page_elev or '?',
-                    })
-                del words
-            except Exception as e:
-                skipped.append(f"лист {idx+1}: {e}")
-            gc.collect()
+                        for t, x, y in words:
+                            if not mark_re.match(t):
+                                continue
+                            let = nearest_letter(letter_axes, x, y)
+                            num = nearest_number(number_axes, x, y)
+                            candidates.append({
+                                'Лист': global_num, 'Марка': t,
+                                'Ось-буква': let or '?', 'Ось-цифра': num or '?',
+                                'Отм.': page_elev or '?',
+                            })
+                        del words
+                    except Exception as e:
+                        skipped.append(f"лист {global_num}: {e}")
+                    gc.collect()
+        except Exception as e:
+            skipped.append(f"часть {start}-{end}: {e}")
+        finally:
+            try: os.unlink(part_path)
+            except: pass
+        gc.collect()
+
+    if not marks_set:
+        return None, "Не найдено таблиц с MARK NAME.", skipped
+
+    records = [r for r in candidates if r['Марка'] in marks_set]
 
     if not records:
-        return None, "Марки не найдены на чертежах.", skipped
+        return None, "Марки из ведомости не найдены на чертежах.", skipped
 
     result = build_result_table(records)
     msg = f"Готово. Листов: {total}, марок в ведомости: {len(marks_set)}, вхождений: {len(records)}."
@@ -243,31 +276,30 @@ def process_pdf(pdf_path):
 st.title("🏗️ Парсер марок из PDF-чертежей")
 st.write(
     "Загрузите PDF с ведомостью марок и чертежами. "
-    "Обработка занимает 2–5 минут — **не обновляйте страницу во время работы**."
+    "Обработка идёт частями по 12 листов — **не закрывайте вкладку**."
 )
 
 uploaded = st.file_uploader("Выберите PDF-файл", type=["pdf"])
 
 if uploaded is not None:
     if st.button("▶ Обработать", type="primary"):
-        # Один статичный статус, без прогресс-бара и спиннера
-        status = st.info("⏳ Обрабатываю PDF... Это может занять 2–5 минут. Не закрывайте вкладку.")
+        status = st.empty()
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
                 tmp.write(uploaded.read())
                 pdf_path = tmp.name
             xlsx_path = pdf_path.replace('.pdf', '.xlsx')
 
-            result, msg, skipped = process_pdf(pdf_path)
+            status.info("⏳ Начинаю обработку…")
+            result, msg, skipped = process_pdf_by_chunks(pdf_path, status)
+            status.empty()
 
             if result is None:
-                status.empty()
                 st.error(msg)
             else:
-                status.empty()
                 st.success(msg)
                 if skipped:
-                    st.warning("Часть листов пропущена: " + "; ".join(skipped[:10]))
+                    st.warning("Пропущенные листы: " + "; ".join(skipped[:10]))
                 result.to_excel(xlsx_path, index=False)
                 with open(xlsx_path, "rb") as f:
                     st.download_button(
