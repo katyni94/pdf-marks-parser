@@ -9,6 +9,7 @@ import gc
 import os
 from pypdf import PdfReader, PdfWriter
 
+st.caption("Версия 3.0 — с диагностикой поиска")
 
 # ---------- Утилиты ----------
 def fix_enc(s):
@@ -75,11 +76,7 @@ def cluster_by(items, axis_idx, tol):
     return groups
 
 
-# ---------- Склейка разбитых слов ----------
 def merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0):
-    """Склеивает соседние слова, у которых нет пробела между ними.
-    ['B','-','1'] → ['B-1'].  ['A',\"'\"] → [\"A'\"].
-    """
     if not words_raw:
         return []
     items = sorted(words_raw, key=lambda w: (round(w['top'], 1), w['x0']))
@@ -98,7 +95,6 @@ def merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0):
     return merged
 
 
-# ---------- Тип страницы и обозначение разреза ----------
 def parse_section_designation(header_text):
     m = re.search(r"([A-ZА-Я0-9\'/]+)-([A-ZА-Я0-9\'/]+)\s*\(\s*(\d+)\s*\)", header_text.upper())
     if m:
@@ -119,7 +115,6 @@ def detect_page_type(header_text):
     return "unknown"
 
 
-# ---------- Поиск осей на плане ----------
 def find_letter_axes_plan(words, wl_letters):
     items = [(t, x, y) for t, x, y in words if t in wl_letters]
     axes = []
@@ -173,7 +168,6 @@ def find_letters_in_section(words, wl_letters, page_height):
     return row
 
 
-# ---------- Поиск ближайшей оси ----------
 def nearest_in_col(letter_axes, x, y):
     if not letter_axes: return None
     nearest_col = min(letter_axes, key=lambda la: abs(la[0] - x))
@@ -237,7 +231,6 @@ def nearest_in_letters_row(letters_row, x):
     return [a[0], b[0]]
 
 
-# ---------- Итоговая таблица ----------
 def combine_letters(val, letter_order):
     if val is None: return '?'
     if isinstance(val, list):
@@ -315,7 +308,6 @@ def build_result_table(records, letter_order, number_order):
     return pd.DataFrame(rows)
 
 
-# ---------- Разбиение PDF ----------
 def split_pdf(pdf_path, chunk_size=12):
     reader = PdfReader(pdf_path)
     total = len(reader.pages)
@@ -330,7 +322,6 @@ def split_pdf(pdf_path, chunk_size=12):
     return total, parts
 
 
-# ---------- Основная обработка ----------
 def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status_slot=None):
     letter_order = {l: i for i, l in enumerate(whitelist_letters)}
     number_order = {n: i for i, n in enumerate(whitelist_numbers)}
@@ -341,6 +332,7 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
     marks_set = set()
     skipped = []
     candidates = []
+    all_found_texts = set()  # диагностика
     mark_re = re.compile(r'^[A-ZА-Я]{1,4}-?\d{1,4}$')
 
     for idx, (start, end, part_path) in enumerate(parts):
@@ -360,13 +352,14 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                         words_raw = page.extract_words()
                         if not words_raw: continue
 
-                        # Оригинал — для осей и определения типа страницы
                         words_for_axes = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
-
-                        # Склеенный — для марок и отметок
                         words = merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0)
-
                         del words_raw
+
+                        # диагностика: все "похожие на марки" тексты
+                        for t, x, y in words:
+                            if mark_re.match(t):
+                                all_found_texts.add(t)
 
                         header = " ".join(t for t, x, y in words_for_axes if y < 150)
                         ptype = detect_page_type(header)
@@ -409,7 +402,6 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                                 })
                             del words, words_for_axes; gc.collect(); continue
 
-                        # план / unknown
                         letter_axes = find_letter_axes_plan(words_for_axes, wl_letters_set)
                         number_axes = find_number_axes_plan(words_for_axes, wl_numbers_set)
 
@@ -437,11 +429,11 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
         gc.collect()
 
     if not marks_set:
-        return None, "Не найдено таблиц с MARK NAME.", skipped, set(), pd.DataFrame()
+        return None, "Не найдено таблиц с MARK NAME.", skipped, set(), pd.DataFrame(), all_found_texts
 
     records = [r for r in candidates if r['Марка'] in marks_set]
     if not records:
-        return None, "Марки из ведомости не найдены на чертежах.", skipped, marks_set, pd.DataFrame()
+        return None, "Марки из ведомости не найдены на чертежах.", skipped, marks_set, pd.DataFrame(), all_found_texts
 
     result = build_result_table(records, letter_order, number_order)
     found_marks = set(r['Марка'] for r in records)
@@ -451,14 +443,14 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
 
     msg = (f"Готово. Листов: {total}, марок в ведомости: {len(marks_set)}, "
            f"найдено марок: {len(found_marks)}, вхождений: {len(records)}.")
-    return result, msg, skipped, missing, missing_df
+    return result, msg, skipped, missing, missing_df, all_found_texts
 
 
 # ---------- UI ----------
 st.title("🏗️ Парсер марок из PDF-чертежей")
 st.write(
     "Загрузите PDF с ведомостью марок и чертежами. "
-    "**Впишите оси проекта** — парсер найдёт только их, остальное проигнорирует."
+    "**Впишите оси проекта** — парсер найдёт только их."
 )
 
 col1, col2 = st.columns(2)
@@ -466,19 +458,67 @@ with col1:
     letters_input = st.text_input(
         "Буквенные оси (через запятую)",
         value="A, B, C, D, E, F",
-        help="Порядок важен! Можно: A', B/1",
     )
 with col2:
     numbers_input = st.text_input(
         "Цифровые оси (через запятую)",
         value="1, 2, 3",
-        help="Порядок важен! Можно: 1, 2, 3, 8/1, 8/2",
     )
 
 whitelist_letters = [x.strip().upper() for x in re.split(r'[,\n;]+', letters_input) if x.strip()]
 whitelist_numbers = [x.strip().upper() for x in re.split(r'[,\n;]+', numbers_input) if x.strip()]
 
 uploaded = st.file_uploader("Выберите PDF-файл", type=["pdf"])
+
+# ---------- ДИАГНОСТИКА: поиск конкретной марки ----------
+st.markdown("---")
+st.subheader("🔎 Диагностика: найти марку в PDF")
+st.caption("Введи марку (например B-2), нажми Найти — покажу все листы, где она встречается, и как извлекается.")
+diag_mark = st.text_input("Марка для поиска", value="")
+if st.button("🔎 Найти в PDF"):
+    if uploaded is None:
+        st.warning("Сначала загрузи PDF.")
+    elif not diag_mark.strip():
+        st.warning("Введи марку.")
+    else:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+            tmp.write(uploaded.read())
+            pdf_path = tmp.name
+        target = diag_mark.strip().upper()
+        found_any = False
+        with pdfplumber.open(pdf_path) as pdf:
+            for i, page in enumerate(pdf.pages):
+                words_raw = page.extract_words()
+                if not words_raw: continue
+                raw_texts = [fix_enc(w['text']) for w in words_raw]
+                merged = merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0)
+
+                # Ищем точное совпадение в склеенных
+                hits_merged = [(t, x, y) for t, x, y in merged if t.upper() == target]
+                # Ищем точное совпадение в оригинале
+                hits_raw = [(t, w['x0'], w['top']) for t, w in zip(raw_texts, words_raw) if t.upper() == target]
+
+                if hits_merged or hits_raw:
+                    found_any = True
+                    st.write(f"**Лист {i+1}**:")
+                    if hits_merged:
+                        st.write(f"  ✅ Найдено в склеенных: {[(t, round(x), round(y)) for t,x,y in hits_merged]}")
+                    if hits_raw:
+                        st.write(f"  ✅ Найдено в оригинале: {[(t, round(x), round(y)) for t,x,y in hits_raw]}")
+
+                # Ищем частичные совпадения (буква + цифра в радиусе)
+                prefix = target.split('-')[0] if '-' in target else target[:2]
+                for j, w in enumerate(raw_texts):
+                    if prefix.upper() in w.upper() and w.upper() != target:
+                        context = raw_texts[max(0,j-3):j+5]
+                        if target.split('-')[-1] in " ".join(context):
+                            st.write(f"  ⚠️ Лист {i+1}, контекст: {context}")
+
+        if not found_any:
+            st.error(f"Марка '{target}' не найдена ни на одном листе (ни в склеенном виде, ни в оригинале).")
+
+# ---------- ОСНОВНАЯ ОБРАБОТКА ----------
+st.markdown("---")
 
 if uploaded is not None:
     if not whitelist_letters or not whitelist_numbers:
@@ -493,7 +533,7 @@ if uploaded is not None:
                 xlsx_path = pdf_path.replace('.pdf', '.xlsx')
 
                 status.info("⏳ Начинаю обработку…")
-                result, msg, skipped, missing, missing_df = process_pdf_by_chunks(
+                result, msg, skipped, missing, missing_df, all_found = process_pdf_by_chunks(
                     pdf_path, whitelist_letters, whitelist_numbers, status)
                 status.empty()
 
@@ -512,6 +552,10 @@ if uploaded is not None:
                         result.to_excel(writer, sheet_name='Марки', index=False)
                         if not missing_df.empty:
                             missing_df.to_excel(writer, sheet_name='Не найдено', index=False)
+                        # Все марко-подобные тексты, найденные в PDF
+                        if all_found:
+                            pd.DataFrame({'Найдено в PDF': sorted(all_found)}).to_excel(
+                                writer, sheet_name='Все тексты марок', index=False)
                     with open(xlsx_path, "rb") as f:
                         st.download_button(
                             label="⬇️ Скачать Excel",
