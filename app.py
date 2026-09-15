@@ -75,12 +75,10 @@ def cluster_by(items, axis_idx, tol):
     return groups
 
 
-# ---------- НОВОЕ: склейка разбитых слов ----------
-def merge_adjacent_words(words_raw, gap_max=2.5, y_tol=1.5):
+# ---------- Склейка разбитых слов ----------
+def merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0):
     """Склеивает соседние слова, у которых нет пробела между ними.
     ['B','-','1'] → ['B-1'].  ['A',\"'\"] → [\"A'\"].
-    words_raw — список словарей от pdfplumber.extract_words() с x0,x1,top.
-    Возвращает список кортежей (text, x0, top).
     """
     if not words_raw:
         return []
@@ -121,7 +119,7 @@ def detect_page_type(header_text):
     return "unknown"
 
 
-# ---------- Поиск осей на плане по whitelist ----------
+# ---------- Поиск осей на плане ----------
 def find_letter_axes_plan(words, wl_letters):
     items = [(t, x, y) for t, x, y in words if t in wl_letters]
     axes = []
@@ -361,13 +359,18 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
 
                         words_raw = page.extract_words()
                         if not words_raw: continue
-                        # НОВОЕ: склейка разбитых слов
-                        words = merge_adjacent_words(words_raw)
+
+                        # Оригинал — для осей и определения типа страницы
+                        words_for_axes = [(fix_enc(w['text']), w['x0'], w['top']) for w in words_raw]
+
+                        # Склеенный — для марок и отметок
+                        words = merge_adjacent_words(words_raw, gap_max=5.0, y_tol=2.0)
+
                         del words_raw
 
-                        header = " ".join(t for t, x, y in words if y < 150)
+                        header = " ".join(t for t, x, y in words_for_axes if y < 150)
                         ptype = detect_page_type(header)
-                        page_elev = get_header_elev(words)
+                        page_elev = get_header_elev(words_for_axes)
                         page_height = page.height
 
                         if ptype == "node":
@@ -378,11 +381,11 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                                     'Ось-буква': 'узел', 'Ось-цифра': 'узел',
                                     'Отм.': page_elev or '?',
                                 })
-                            del words; gc.collect(); continue
+                            del words, words_for_axes; gc.collect(); continue
 
                         if ptype == "section":
                             section = parse_section_designation(header)
-                            letters_row = find_letters_in_section(words, wl_letters_set, page_height)
+                            letters_row = find_letters_in_section(words_for_axes, wl_letters_set, page_height)
 
                             num_default = None
                             if section:
@@ -404,11 +407,11 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                                     'Ось-буква': let, 'Ось-цифра': num,
                                     'Отм.': elev,
                                 })
-                            del words; gc.collect(); continue
+                            del words, words_for_axes; gc.collect(); continue
 
                         # план / unknown
-                        letter_axes = find_letter_axes_plan(words, wl_letters_set)
-                        number_axes = find_number_axes_plan(words, wl_numbers_set)
+                        letter_axes = find_letter_axes_plan(words_for_axes, wl_letters_set)
+                        number_axes = find_number_axes_plan(words_for_axes, wl_numbers_set)
 
                         for t, x, y in words:
                             if not mark_re.match(t): continue
@@ -422,7 +425,7 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
                                 'Ось-буква': let, 'Ось-цифра': num,
                                 'Отм.': elev,
                             })
-                        del words
+                        del words, words_for_axes
                     except Exception as e:
                         skipped.append(f"лист {global_num}: {e}")
                     gc.collect()
@@ -434,18 +437,21 @@ def process_pdf_by_chunks(pdf_path, whitelist_letters, whitelist_numbers, status
         gc.collect()
 
     if not marks_set:
-        return None, "Не найдено таблиц с MARK NAME.", skipped, set()
+        return None, "Не найдено таблиц с MARK NAME.", skipped, set(), pd.DataFrame()
 
     records = [r for r in candidates if r['Марка'] in marks_set]
     if not records:
-        return None, "Марки из ведомости не найдены на чертежах.", skipped, marks_set
+        return None, "Марки из ведомости не найдены на чертежах.", skipped, marks_set, pd.DataFrame()
 
     result = build_result_table(records, letter_order, number_order)
     found_marks = set(r['Марка'] for r in records)
     missing = marks_set - found_marks
 
-    msg = f"Готово. Листов: {total}, марок в ведомости: {len(marks_set)}, найдено марок: {len(found_marks)}, вхождений: {len(records)}."
-    return result, msg, skipped, missing
+    missing_df = pd.DataFrame({'Пропавшие марки': sorted(missing)}) if missing else pd.DataFrame()
+
+    msg = (f"Готово. Листов: {total}, марок в ведомости: {len(marks_set)}, "
+           f"найдено марок: {len(found_marks)}, вхождений: {len(records)}.")
+    return result, msg, skipped, missing, missing_df
 
 
 # ---------- UI ----------
@@ -460,7 +466,7 @@ with col1:
     letters_input = st.text_input(
         "Буквенные оси (через запятую)",
         value="A, B, C, D, E, F",
-        help="Порядок важен! По нему строятся диапазоны. Можно: A', B/1",
+        help="Порядок важен! Можно: A', B/1",
     )
 with col2:
     numbers_input = st.text_input(
@@ -487,7 +493,7 @@ if uploaded is not None:
                 xlsx_path = pdf_path.replace('.pdf', '.xlsx')
 
                 status.info("⏳ Начинаю обработку…")
-                result, msg, skipped, missing = process_pdf_by_chunks(
+                result, msg, skipped, missing, missing_df = process_pdf_by_chunks(
                     pdf_path, whitelist_letters, whitelist_numbers, status)
                 status.empty()
 
@@ -502,7 +508,10 @@ if uploaded is not None:
                             f"**Не найдено на чертежах: {len(missing)} марок.** "
                             f"Первые 30: " + ", ".join(sorted(missing)[:30])
                         )
-                    result.to_excel(xlsx_path, index=False)
+                    with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
+                        result.to_excel(writer, sheet_name='Марки', index=False)
+                        if not missing_df.empty:
+                            missing_df.to_excel(writer, sheet_name='Не найдено', index=False)
                     with open(xlsx_path, "rb") as f:
                         st.download_button(
                             label="⬇️ Скачать Excel",
