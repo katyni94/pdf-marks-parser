@@ -9,7 +9,7 @@ import gc
 import os
 from pypdf import PdfReader, PdfWriter
 
-st.caption("Версия 10.0 — сокращение марок + защита от падения")
+st.caption("Версия 11.0 — надёжный поиск ведомости")
 
 
 # ---------- Утилиты ----------
@@ -47,7 +47,6 @@ def reduce_mark(mark):
 
 
 def reduce_marks_set(marks_set):
-    """Применяет сокращение ко всем маркам. Схлопывает дубликаты."""
     result = set()
     for m in marks_set:
         result.add(reduce_mark(m))
@@ -60,28 +59,103 @@ def get_page_tables(page):
     except Exception: return []
 
 
+def _header_has_mark_name(header_text):
+    """Проверяет строку на любые варианты 'MARK NAME'."""
+    if not header_text: return False
+    u = header_text.upper()
+    compact = re.sub(r'[\s_\-]+', '', u)
+    return ("MARKNAME" in compact) or ("НАИМЕНОВАНИЕМАРКИ" in compact)
+
+
 def page_has_mark_name(tables):
     for t in tables:
         if not t or not t[0]: continue
-        h = [(x or "").strip().upper() for x in t[0]]
-        if "MARK NAME" in h: return True
+        for row in t[:4]:
+            if not row: continue
+            for cell in row:
+                if cell and _header_has_mark_name(str(cell)):
+                    return True
     return False
 
 
 def extract_marks_from_tables(tables):
+    """Гибкий поиск марок. Работает с 'MARK NAME', 'MARK\nNAME', 'MARKNAME'."""
     found = set()
     for t in tables:
-        if not t or not t[0]: continue
-        h = [(x or "").strip().upper() for x in t[0]]
-        if "MARK NAME" not in h: continue
-        cm = h.index("MARK NAME")
-        for row in t[2:]:
-            if row and len(row) > cm and row[cm]:
-                found.add(row[cm].strip())
+        if not t: continue
+
+        # Ищем столбец MARK NAME в первых 4 строках
+        mark_col = None
+        header_row_idx = 0
+        for ri, row in enumerate(t[:4]):
+            if not row: continue
+            for ci, cell in enumerate(row):
+                if cell and _header_has_mark_name(str(cell)):
+                    mark_col = ci
+                    header_row_idx = ri
+                    break
+            if mark_col is not None:
+                break
+
+        if mark_col is None:
+            continue
+
+        for row in t[header_row_idx + 1:]:
+            if not row or mark_col >= len(row): continue
+            val = row[mark_col]
+            if val and str(val).strip():
+                found.add(str(val).strip())
     return found
 
 
-# ---------- Нечёткое сопоставление ----------
+def extract_marks_from_words(words):
+    """Fallback: ищем марки через extract_words по координатам.
+    words = [(text, x0, top), ...] — уже после fix_enc."""
+    mark_words = []
+    name_words = []
+    qty_words = []
+    for t, x, y in words:
+        u = t.upper().strip()
+        if u in ("MARK", "МАРКИ", "МАРКА"): mark_words.append((t, x, y))
+        if u in ("NAME", "НАИМЕНОВАНИЕ"): name_words.append((t, x, y))
+        if u in ("QTY", "КОЛ-ВО", "КОЛИЧЕСТВО"): qty_words.append((t, x, y))
+
+    if not mark_words and not name_words:
+        return set()
+
+    all_hdr = mark_words + name_words
+    descr_words = [(t, x, y) for t, x, y in words
+                   if t.upper().strip() in ("DESCRIPTION", "ОПИСАНИЕ")]
+
+    candidates_right = qty_words + descr_words
+    if candidates_right:
+        x_start = max(w[1] for w in all_hdr) - 5
+        x_end = min(w[1] for w in candidates_right)
+    else:
+        x_start = max(w[1] for w in all_hdr) - 5
+        x_end = x_start + 400
+
+    y_start = max(w[2] for w in all_hdr) + 5
+
+    result = set()
+    for t, x, y in words:
+        if y < y_start: continue
+        if not (x_start <= x <= x_end): continue
+        u = t.upper().strip()
+        if len(u) >= 5 and re.search(r'\d', u) and '-' in u:
+            result.add(t.strip())
+    return result
+
+
+def page_might_have_vedomost(page):
+    try:
+        text = page.extract_text() or ""
+        return _header_has_mark_name(text)
+    except Exception:
+        return False
+
+
+# ---------- Нечёткое сопоставление марки ----------
 def build_mark_lookup(marks_set):
     marks_by_len = {}
     all_marks = set()
@@ -149,7 +223,7 @@ def cluster_by(items, axis_idx, tol):
     return groups
 
 
-# ---------- Склейка ----------
+# ---------- Склейка разбитых слов ----------
 def merge_adjacent_words(words_raw, gap_max=12.0, y_tol=2.5):
     if not words_raw: return []
     items = sorted(words_raw, key=lambda w: (round(w['top'], 1), w['x0']))
@@ -427,18 +501,7 @@ def split_pdf(pdf_path, chunk_size=8):
     return total, parts
 
 
-# ---------- Проход 1: собрать whitelist ----------
-def page_might_have_vedomost(page):
-    """Быстрая проверка: есть ли на странице надпись MARK NAME (без извлечения таблиц)."""
-    try:
-        # extract_text() в разы быстрее extract_tables()
-        text = page.extract_text() or ""
-        up = text.upper()
-        return ("MARK NAME" in up) or ("НАИМЕНОВАНИЕ МАРКИ" in up) or ("MARKNAME" in up)
-    except Exception:
-        return False
-
-
+# ---------- Этап 1: whitelist ----------
 def collect_whitelist(pdf_path, status_slot=None):
     total, parts = split_pdf(pdf_path, chunk_size=8)
     marks_raw = set()
@@ -450,15 +513,23 @@ def collect_whitelist(pdf_path, status_slot=None):
                 for local_idx, page in enumerate(pdf.pages):
                     global_num = start + local_idx
                     try:
-                        # 1. Быстрый фильтр
                         if not page_might_have_vedomost(page):
                             continue
 
-                        # 2. Только для страниц с MARK NAME — тяжёлая операция
                         tables = get_page_tables(page)
-                        if page_has_mark_name(tables):
-                            marks_raw |= extract_marks_from_tables(tables)
+                        found_tables = extract_marks_from_tables(tables)
                         del tables
+
+                        if len(found_tables) < 3:
+                            words_raw = page.extract_words()
+                            if words_raw:
+                                words = [(fix_enc(w['text']), w['x0'], w['top'])
+                                         for w in words_raw]
+                                found_words = extract_marks_from_words(words)
+                                del words, words_raw
+                                found_tables |= found_words
+
+                        marks_raw |= found_tables
                     except Exception:
                         pass
                     gc.collect()
@@ -469,7 +540,7 @@ def collect_whitelist(pdf_path, status_slot=None):
     return marks_raw
 
 
-# ---------- Проход 2: обработка чертежей ----------
+# ---------- Этап 2: чертежи ----------
 def process_drawings(pdf_path, whitelist_letters, whitelist_numbers,
                      marks_set, status_slot=None):
     letter_order = {l: i for i, l in enumerate(whitelist_letters)}
@@ -623,7 +694,6 @@ if uploaded is not None:
                     pdf_path = tmp.name
                 xlsx_path = pdf_path.replace('.pdf', '.xlsx')
 
-                # Этап 1 — БЕЗ промежуточных обновлений UI
                 status.info("⏳ Этап 1/2 — читаю ведомость марок…")
                 marks_raw = collect_whitelist(pdf_path, None)
 
@@ -637,7 +707,6 @@ if uploaded is not None:
                     else:
                         marks_set = set(m.strip().upper() for m in marks_raw)
 
-                    # Этап 2 — БЕЗ промежуточных обновлений UI
                     status.info("⏳ Этап 2/2 — обрабатываю чертежи…")
                     candidates, all_elevs, skipped, letter_order, number_order = process_drawings(
                         pdf_path, whitelist_letters, whitelist_numbers, marks_set, None)
@@ -649,8 +718,7 @@ if uploaded is not None:
 
                     found_marks = set(r['Марка'] for r in candidates)
 
-                    # Итоговая сводка ОДНИМ сообщением
-                    st.success(f"✅ Готово.")
+                    st.success("✅ Готово.")
                     st.write(f"**Марок в ведомости:** {len(marks_raw)} → после обработки **{len(marks_set)}** уникальных.")
                     st.write(f"**Найдено на чертежах:** {len(found_marks)}")
                     st.write(f"**Вхождений:** {len(candidates)}")
@@ -658,7 +726,6 @@ if uploaded is not None:
                     if skipped:
                         st.warning("Пропущено листов: " + "; ".join(skipped[:5]))
 
-                    # Примеры сокращения — простым текстом, без markdown
                     if reduce_enabled and marks_raw:
                         sample_raw = sorted(marks_raw)[:5]
                         sample_str = " | ".join(
