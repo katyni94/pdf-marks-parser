@@ -428,6 +428,17 @@ def split_pdf(pdf_path, chunk_size=8):
 
 
 # ---------- Проход 1: собрать whitelist ----------
+def page_might_have_vedomost(page):
+    """Быстрая проверка: есть ли на странице надпись MARK NAME (без извлечения таблиц)."""
+    try:
+        # extract_text() в разы быстрее extract_tables()
+        text = page.extract_text() or ""
+        up = text.upper()
+        return ("MARK NAME" in up) or ("НАИМЕНОВАНИЕ МАРКИ" in up) or ("MARKNAME" in up)
+    except Exception:
+        return False
+
+
 def collect_whitelist(pdf_path, status_slot=None):
     total, parts = split_pdf(pdf_path, chunk_size=8)
     marks_raw = set()
@@ -436,8 +447,14 @@ def collect_whitelist(pdf_path, status_slot=None):
             status_slot.info(f"⏳ Этап 1/2 — читаю ведомость: листы {start}–{end}")
         try:
             with pdfplumber.open(part_path) as pdf:
-                for page in pdf.pages:
+                for local_idx, page in enumerate(pdf.pages):
+                    global_num = start + local_idx
                     try:
+                        # 1. Быстрый фильтр
+                        if not page_might_have_vedomost(page):
+                            continue
+
+                        # 2. Только для страниц с MARK NAME — тяжёлая операция
                         tables = get_page_tables(page)
                         if page_has_mark_name(tables):
                             marks_raw |= extract_marks_from_tables(tables)
