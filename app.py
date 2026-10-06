@@ -101,9 +101,32 @@ def extract_marks_from_tables(tables):
 
 
 def page_might_have_vedomost(page):
+    """Проверяем — есть ли на странице текст, похожий на шапку ведомости.
+    Работает через extract_words (надёжнее, чем extract_text)."""
     try:
-        text = page.extract_text() or ""
-        return _header_has_mark_name(text)
+        words_raw = page.extract_words()
+        if not words_raw:
+            return False
+        # Проверяем текст через extract_text
+        try:
+            text = page.extract_text() or ""
+            if _header_has_mark_name(text):
+                return True
+        except Exception:
+            pass
+        # Fallback: пробегаем по словам и ищем MARK + NAME рядом
+        words = [(fix_enc(w['text']).upper().strip(), w['x0'], w['top'])
+                 for w in words_raw]
+        has_mark = any(t in ("MARK", "МАРКИ", "МАРКА") for t, _, _ in words)
+        has_name = any(t in ("NAME", "НАИМЕНОВАНИЕ") for t, _, _ in words)
+        if has_mark and has_name:
+            return True
+        # Ещё вариант — компактный MARKNAME в одном слове
+        for t, _, _ in words:
+            compact = re.sub(r'[\s_\-]+', '', t)
+            if "MARKNAME" in compact or "НАИМЕНОВАНИЕМАРКИ" in compact:
+                return True
+        return False
     except Exception:
         return False
 
@@ -471,10 +494,23 @@ def collect_whitelist(pdf_path, status_slot=None):
                     try:
                         if not page_might_have_vedomost(page):
                             continue
+
+                        # 1. Основной путь — extract_tables
                         tables = get_page_tables(page)
-                        found_tables = extract_marks_from_tables(tables)
+                        found = extract_marks_from_tables(tables)
                         del tables
-                        marks_raw |= found_tables
+
+                        # 2. Если нашли мало или ничего — fallback через слова
+                        if len(found) < 3:
+                            words_raw = page.extract_words()
+                            if words_raw:
+                                words = [(fix_enc(w['text']), w['x0'], w['top'])
+                                         for w in words_raw]
+                                found_words = extract_marks_from_words(words)
+                                del words, words_raw
+                                found |= found_words
+
+                        marks_raw |= found
                     except Exception:
                         pass
                     gc.collect()
