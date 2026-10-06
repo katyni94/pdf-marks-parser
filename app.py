@@ -99,6 +99,50 @@ def extract_marks_from_tables(tables):
                 found.add(str(val).strip())
     return found
 
+def extract_marks_from_words(words):
+    """Fallback: ищем марки по координатам слов.
+    words = [(text, x0, top), ...] — уже после fix_enc."""
+    mark_words = []
+    name_words = []
+    qty_words = []
+    descr_words = []
+
+    for t, x, y in words:
+        u = t.upper().strip()
+        if u in ("MARK", "МАРКИ", "МАРКА"): mark_words.append((t, x, y))
+        elif u in ("NAME", "НАИМЕНОВАНИЕ"): name_words.append((t, x, y))
+        elif u in ("QTY", "КОЛ-ВО", "КОЛИЧЕСТВО"): qty_words.append((t, x, y))
+        elif u in ("DESCRIPTION", "ОПИСАНИЕ"): descr_words.append((t, x, y))
+        elif re.sub(r'[\s_\-]+', '', u) in ("MARKNAME", "НАИМЕНОВАНИЕМАРКИ"):
+            mark_words.append((t, x, y))
+
+    if not mark_words and not name_words:
+        return set()
+
+    all_hdr = mark_words + name_words
+    candidates_right = qty_words + descr_words
+    if candidates_right:
+        x_start = min(w[1] for w in all_hdr) - 10
+        x_end = min(w[1] for w in candidates_right)
+    else:
+        x_start = min(w[1] for w in all_hdr) - 10
+        x_end = x_start + 500
+
+    y_start = max(w[2] for w in all_hdr) + 3
+
+    result = set()
+    for t, x, y in words:
+        if y < y_start: continue
+        if not (x_start <= x <= x_end): continue
+        u = t.upper().strip()
+        if len(u) < 4: continue
+        if not re.search(r'\d', u): continue
+        if not ('-' in u or '_' in u): continue
+        if u.startswith(("PL", "ГОСТ", "GOST", "L", "[", "I2", "I4")):
+            continue
+        result.add(t.strip())
+
+    return result
 
 def page_might_have_vedomost(page):
     """Проверяем — есть ли на странице текст, похожий на шапку ведомости.
